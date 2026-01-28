@@ -97,9 +97,17 @@ else
 fi
 chmod +x "$HOME/.lily-host/lily-host.js"
 
+# Create shell wrapper (Chrome native messaging works better with a shell script on macOS)
+NODE_BIN=$(which node)
+cat > "$HOME/.lily-host/lily-host" << WRAPPER_EOF
+#!/bin/bash
+exec "$NODE_BIN" "\$HOME/.lily-host/lily-host.js"
+WRAPPER_EOF
+chmod +x "$HOME/.lily-host/lily-host"
+
 # --- Register native messaging manifest ---
 HOST_NAME="com.lily.host"
-HOST_PATH="$HOME/.lily-host/lily-host.js"
+HOST_PATH="$HOME/.lily-host/lily-host"
 NODE_PATH=$(which node)
 
 # macOS

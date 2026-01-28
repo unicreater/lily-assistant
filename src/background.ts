@@ -75,7 +75,10 @@ async function sendNative(action: string, payload: any = {}): Promise<any> {
 }
 
 // Listen for messages from side panel
+console.log("[Lily BG] Background script loaded");
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  console.log("[Lily BG] Received message:", JSON.stringify(msg));
   if (msg?.type === "native") {
     sendNative(msg.action, msg.payload)
       .then((result) => {

@@ -13,8 +13,11 @@ function SidePanel() {
   const [hostInfo, setHostInfo] = useState<any>(null);
 
   const checkConnection = async () => {
+    console.log("[Lily SidePanel] checkConnection called");
     try {
+      console.log("[Lily SidePanel] sending ping...");
       const res = await chrome.runtime.sendMessage({ type: "native", action: "ping" });
+      console.log("[Lily SidePanel] ping response:", JSON.stringify(res));
       if (res?.ok) {
         setConnected(true);
         setHostInfo(res);
@@ -23,7 +26,8 @@ function SidePanel() {
         setConnected(false);
         setView("setup");
       }
-    } catch {
+    } catch (err: any) {
+      console.error("[Lily SidePanel] ping error:", err?.message || err);
       setConnected(false);
       setView("setup");
     }
