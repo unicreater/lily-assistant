@@ -40,7 +40,7 @@ function findClaude() {
   }
 }
 
-const CLAUDE_PATH = findClaude();
+// Note: Don't cache CLAUDE_PATH - check on each ping so user can install mid-session
 
 // --- Ensure directories ---
 function ensureDirs() {
@@ -89,7 +89,7 @@ async function handleMessage(msg) {
     let result;
     switch (action) {
       case "ping":
-        result = { ok: true, version: VERSION, lilyDir: LILY_DIR, claudePath: CLAUDE_PATH };
+        result = { ok: true, version: VERSION, lilyDir: LILY_DIR, claudePath: findClaude() };
         break;
       case "chat":
         result = await handleChat(payload);
@@ -124,13 +124,14 @@ async function handleMessage(msg) {
 // --- Claude CLI spawn ---
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
-    if (!CLAUDE_PATH) {
-      return reject(new Error("Claude CLI not found. Install it and re-run install.sh."));
+    const claudePath = findClaude();
+    if (!claudePath) {
+      return reject(new Error("Claude CLI not found. Please install it with: npm install -g @anthropic-ai/claude-code"));
     }
 
     let stdout = "";
     let stderr = "";
-    const proc = spawn(CLAUDE_PATH, ["-p", prompt], {
+    const proc = spawn(claudePath, ["-p", prompt], {
       cwd: LILY_DIR,
       timeout: TIMEOUT_MS,
       env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin" },
