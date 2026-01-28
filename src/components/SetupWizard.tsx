@@ -5,17 +5,16 @@ interface Props {
 }
 
 export function SetupWizard({ onRetry }: Props) {
-  const [copiedInstall, setCopiedInstall] = useState(false);
-  const [copiedId, setCopiedId] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [checking, setChecking] = useState(false);
   const extensionId = chrome.runtime.id;
 
-  const installCmd = `curl -fsSL https://raw.githubusercontent.com/unicreater/lily-assistant/main/native-host/install.sh | bash`;
+  const installCmd = `curl -fsSL https://raw.githubusercontent.com/unicreater/lily-assistant/main/native-host/install.sh | bash -s ${extensionId}`;
 
-  const copy = (text: string, setter: (v: boolean) => void) => {
-    navigator.clipboard.writeText(text);
-    setter(true);
-    setTimeout(() => setter(false), 2000);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(installCmd);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   const handleRetry = async () => {
@@ -33,36 +32,22 @@ export function SetupWizard({ onRetry }: Props) {
 
       <div className="space-y-3">
         <div className="glass-card rounded-lg p-3">
-          <p className="text-xs text-lily-muted mb-1">Step 1 — Open Terminal and run this</p>
-          <p className="text-[10px] text-lily-muted mb-2">
-            Downloads and installs the Lily native host. Requires Node.js and Claude CLI.
+          <p className="text-xs text-lily-muted mb-2">
+            Open Terminal and paste this command:
           </p>
-          <div className="flex items-start gap-2">
-            <code className="text-xs text-lily-text flex-1 break-all">{installCmd}</code>
-            <button
-              onClick={() => copy(installCmd, setCopiedInstall)}
-              className="text-xs px-2 py-1 rounded bg-lily-accent/90 text-white hover:bg-lily-hover shrink-0"
-            >
-              {copiedInstall ? "Copied" : "Copy"}
-            </button>
-          </div>
+          <code className="block text-xs text-lily-text break-all mb-2 leading-relaxed">{installCmd}</code>
+          <button
+            onClick={handleCopy}
+            className="w-full py-1.5 rounded bg-lily-accent/90 text-white text-xs font-medium hover:bg-lily-hover transition-colors"
+          >
+            {copied ? "Copied!" : "Copy to Clipboard"}
+          </button>
         </div>
 
         <div className="glass-card rounded-lg p-3">
-          <p className="text-xs text-lily-muted mb-1">Step 2 — When prompted, paste your Extension ID</p>
-          <div className="flex items-center gap-2">
-            <code className="text-sm text-lily-accent select-all flex-1">{extensionId}</code>
-            <button
-              onClick={() => copy(extensionId, setCopiedId)}
-              className="text-xs px-2 py-1 rounded bg-lily-accent/90 text-white hover:bg-lily-hover shrink-0"
-            >
-              {copiedId ? "Copied" : "Copy"}
-            </button>
-          </div>
-        </div>
-
-        <div className="glass-card rounded-lg p-3">
-          <p className="text-xs text-lily-muted">Step 3 — Restart Chrome, then click below</p>
+          <p className="text-xs text-lily-muted">
+            After it finishes, restart Chrome and click below.
+          </p>
         </div>
       </div>
 
