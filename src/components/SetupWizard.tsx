@@ -46,7 +46,7 @@ export function SetupWizard({ onRetry }: Props) {
 
         <div className="glass-card rounded-lg p-3">
           <p className="text-xs text-lily-muted">
-            After it finishes, restart Chrome and click below.
+            After it finishes, <strong className="text-lily-text">fully quit Chrome</strong> (Cmd+Q / Alt+F4) and reopen it. This is only needed once.
           </p>
         </div>
       </div>
