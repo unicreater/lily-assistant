@@ -13,9 +13,10 @@ let reqCounter = 0;
 
 function connect(): chrome.runtime.Port {
   if (port) return port;
-  port = chrome.runtime.connectNative(HOST_NAME);
 
-  port.onMessage.addListener((msg: any) => {
+  const newPort = chrome.runtime.connectNative(HOST_NAME);
+
+  newPort.onMessage.addListener((msg: any) => {
     const { id, ...rest } = msg;
     const entry = pending.get(id);
     if (entry) {
@@ -25,10 +26,11 @@ function connect(): chrome.runtime.Port {
     }
   });
 
-  port.onDisconnect.addListener(() => {
+  newPort.onDisconnect.addListener(() => {
     const error = chrome.runtime.lastError?.message || "Native host disconnected";
-    // Reject all pending
-    for (const [id, entry] of pending) {
+    console.error("[Lily] Native host disconnected:", error);
+    // Reject all pending requests
+    for (const [, entry] of pending) {
       clearTimeout(entry.timer);
       entry.reject(new Error(error));
     }
@@ -36,10 +38,11 @@ function connect(): chrome.runtime.Port {
     port = null;
   });
 
+  port = newPort;
   return port;
 }
 
-function sendNative(action: string, payload: any = {}): Promise<any> {
+async function sendNative(action: string, payload: any = {}): Promise<any> {
   return new Promise((resolve, reject) => {
     const id = `req_${++reqCounter}_${Date.now()}`;
     const timer = setTimeout(() => {
@@ -52,11 +55,22 @@ function sendNative(action: string, payload: any = {}): Promise<any> {
     try {
       const p = connect();
       p.postMessage({ id, action, payload });
-    } catch (e) {
+    } catch (e: any) {
       clearTimeout(timer);
       pending.delete(id);
       reject(e);
     }
+
+    // If the port disconnected synchronously during connect(),
+    // the pending map is already cleared and reject was called.
+    // But if it happens in the next microtask, we need a safety check.
+    setTimeout(() => {
+      if (pending.has(id) && !port) {
+        clearTimeout(timer);
+        pending.delete(id);
+        reject(new Error("Native host connection failed"));
+      }
+    }, 100);
   });
 }
 
@@ -64,8 +78,13 @@ function sendNative(action: string, payload: any = {}): Promise<any> {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "native") {
     sendNative(msg.action, msg.payload)
-      .then((result) => sendResponse({ ok: true, ...result }))
-      .catch((err) => sendResponse({ ok: false, error: err.message }));
+      .then((result) => {
+        sendResponse(result);
+      })
+      .catch((err) => {
+        console.error("[Lily] sendNative error:", err.message);
+        sendResponse({ ok: false, error: err.message });
+      });
     return true; // keep channel open for async response
   }
 });
