@@ -5,80 +5,69 @@ interface Props {
 }
 
 export function ClaudeSetup({ onRetry }: Props) {
-  const [copiedInstall, setCopiedInstall] = useState(false);
-  const [copiedLogin, setCopiedLogin] = useState(false);
+  const [loggingIn, setLoggingIn] = useState(false);
   const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const installCmd = "npm install -g @anthropic-ai/claude-code";
-  const loginCmd = "claude login";
-
-  const copy = (text: string, setter: (v: boolean) => void) => {
-    navigator.clipboard.writeText(text);
-    setter(true);
-    setTimeout(() => setter(false), 2000);
+  const handleLogin = async () => {
+    setLoggingIn(true);
+    setError(null);
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "native", action: "login" });
+      if (res?.ok) {
+        // Login window opened, user needs to complete in browser
+        setLoggingIn(false);
+      } else {
+        setError(res?.error || "Failed to start login");
+        setLoggingIn(false);
+      }
+    } catch (e) {
+      setError("Failed to connect to native host");
+      setLoggingIn(false);
+    }
   };
 
-  const handleRetry = async () => {
+  const handleCheckStatus = async () => {
     setChecking(true);
+    setError(null);
     await onRetry();
     setChecking(false);
   };
 
   return (
     <div className="p-4 space-y-4">
-      <h2 className="text-lg font-semibold text-lily-accent">Claude CLI Setup</h2>
+      <h2 className="text-lg font-semibold text-lily-accent">Login to Claude</h2>
       <p className="text-sm text-lily-muted">
-        Lily uses Claude CLI to power conversations. Let's set it up.
+        Lily is connected! Now authenticate with Claude to start chatting.
       </p>
 
-      <div className="space-y-3">
-        <div className="glass-card rounded-lg p-3">
-          <p className="text-xs text-lily-muted mb-2">
-            Step 1 — Install Claude CLI
-          </p>
-          <div className="flex items-center gap-2">
-            <code className="text-xs text-lily-text flex-1 break-all">{installCmd}</code>
-            <button
-              onClick={() => copy(installCmd, setCopiedInstall)}
-              className="text-xs px-2 py-1 rounded bg-lily-accent/90 text-white hover:bg-lily-hover shrink-0"
-            >
-              {copiedInstall ? "Copied!" : "Copy"}
-            </button>
-          </div>
-        </div>
+      <div className="glass-card rounded-lg p-4 space-y-3">
+        <button
+          onClick={handleLogin}
+          disabled={loggingIn}
+          className="w-full py-2.5 rounded-lg bg-lily-accent text-white font-medium hover:bg-lily-hover transition-colors disabled:opacity-50"
+        >
+          {loggingIn ? "Opening Terminal..." : "Open Claude Login"}
+        </button>
 
-        <div className="glass-card rounded-lg p-3">
-          <p className="text-xs text-lily-muted mb-2">
-            Step 2 — Login to Claude
-          </p>
-          <p className="text-[10px] text-lily-muted mb-2">
-            This opens a browser window to authenticate with your Anthropic account.
-          </p>
-          <div className="flex items-center gap-2">
-            <code className="text-xs text-lily-text flex-1">{loginCmd}</code>
-            <button
-              onClick={() => copy(loginCmd, setCopiedLogin)}
-              className="text-xs px-2 py-1 rounded bg-lily-accent/90 text-white hover:bg-lily-hover shrink-0"
-            >
-              {copiedLogin ? "Copied!" : "Copy"}
-            </button>
-          </div>
-        </div>
-
-        <div className="glass-card rounded-lg p-3">
-          <p className="text-xs text-lily-muted">
-            Step 3 — After login completes, click below
-          </p>
-        </div>
+        <p className="text-xs text-lily-muted text-center">
+          Terminal will open. Follow the prompts to authenticate.
+        </p>
       </div>
 
-      <button
-        onClick={handleRetry}
-        disabled={checking}
-        className="w-full py-2 rounded-lg bg-lily-accent/90 text-white font-medium hover:bg-lily-hover transition-colors disabled:opacity-50"
-      >
-        {checking ? "Checking..." : "I've logged in to Claude"}
-      </button>
+      {error && (
+        <p className="text-xs text-red-400">{error}</p>
+      )}
+
+      <div className="pt-2">
+        <button
+          onClick={handleCheckStatus}
+          disabled={checking}
+          className="w-full py-2 rounded-lg border border-lily-accent/30 text-lily-accent font-medium hover:bg-lily-accent/10 transition-colors disabled:opacity-50"
+        >
+          {checking ? "Checking..." : "I've completed login"}
+        </button>
+      </div>
     </div>
   );
 }

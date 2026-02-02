@@ -12,6 +12,14 @@ body {
   color: #e0e0e0;
 }
 
+@layer utilities {
+  /* Force long URLs and words to wrap */
+  .break-anywhere {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+}
+
 @layer components {
   .glass {
     background: rgba(22, 33, 62, 0.4);
