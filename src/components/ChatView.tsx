@@ -345,6 +345,14 @@ export function ChatView() {
   const [streamingToolCalls, setStreamingToolCalls] = useState<ToolUseBlock[]>([]);
   const [streamingToolResults, setStreamingToolResults] = useState<Map<string, ToolResultBlock>>(new Map());
 
+  // Context awareness - auto-include page content
+  const [contextEnabled, setContextEnabled] = useState(false);
+  const [pageContext, setPageContext] = useState<{ title: string; url: string; text: string } | null>(null);
+  const [contextLoading, setContextLoading] = useState(false);
+
+  // Form submission confirmation
+  const [pendingSubmit, setPendingSubmit] = useState<{ selector: string; action: string; method: string; tabId: number } | null>(null);
+
   // Persist history to localStorage
   useEffect(() => {
     try {
@@ -635,6 +643,311 @@ export function ChatView() {
   const handleIntegrationsCommand = useCallback(() => setTab("integrations"), []);
   const handleWorkflowsCommand = useCallback(() => setTab("workflows"), []);
 
+  // Fill command - fill form fields
+  // Usage: /fill field1=value1 field2=value2 OR /fill [natural language instructions]
+  const handleFillCommand = useCallback(async (args: string) => {
+    if (!args.trim()) {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: "Usage: `/fill email=test@example.com name=John Doe`\n\nOr describe what to fill: `/fill fill the email with my work email`"
+      }]);
+      return;
+    }
+
+    setMessages((prev) => [...prev, { role: "user", text: `/fill ${args}` }]);
+    setLoading(true);
+    setCurrentStatus("Filling form...");
+
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!activeTab?.id) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "No active tab found." }]);
+        return;
+      }
+
+      // Check if args contains field=value pairs
+      const pairPattern = /(\w+)\s*=\s*("[^"]+"|'[^']+'|[^\s]+)/g;
+      const pairs: { field: string; value: string }[] = [];
+      let match;
+
+      while ((match = pairPattern.exec(args)) !== null) {
+        let value = match[2];
+        // Remove quotes if present
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        pairs.push({ field: match[1], value });
+      }
+
+      if (pairs.length > 0) {
+        // Direct field=value filling
+        const formsResponse = await chrome.tabs.sendMessage(activeTab.id, { type: "getFormFields" });
+
+        if (!formsResponse?.ok || !formsResponse.forms?.length) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "No forms found on this page." }]);
+          return;
+        }
+
+        // Try to match fields and fill them
+        const results: string[] = [];
+        for (const { field, value } of pairs) {
+          // Find matching field across all forms
+          let filled = false;
+          for (const form of formsResponse.forms) {
+            for (const formField of form.fields) {
+              const fieldName = (formField.name || formField.label || "").toLowerCase();
+              if (fieldName.includes(field.toLowerCase()) || field.toLowerCase().includes(fieldName)) {
+                const fillResponse = await chrome.tabs.sendMessage(activeTab.id, {
+                  type: "fillFormField",
+                  selector: formField.selector,
+                  value,
+                });
+                if (fillResponse?.ok) {
+                  results.push(`Filled **${formField.label || formField.name}** with "${value}"`);
+                  filled = true;
+                  break;
+                }
+              }
+            }
+            if (filled) break;
+          }
+          if (!filled) {
+            results.push(`Could not find field matching "${field}"`);
+          }
+        }
+
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: results.join("\n")
+        }]);
+      } else {
+        // Natural language - ask Claude to help
+        const formsResponse = await chrome.tabs.sendMessage(activeTab.id, { type: "getFormFields" });
+
+        if (!formsResponse?.ok || !formsResponse.forms?.length) {
+          setMessages((prev) => [...prev, { role: "assistant", text: "No forms found on this page to fill." }]);
+          return;
+        }
+
+        // Format forms for Claude
+        let formContext = "Forms on this page:\n";
+        formsResponse.forms.forEach((form: any, i: number) => {
+          formContext += `Form ${i + 1} (${form.id}):\n`;
+          form.fields.forEach((f: any) => {
+            formContext += `  - ${f.label || f.name || f.placeholder} (${f.type})\n`;
+          });
+        });
+
+        // Send to Claude
+        const res = await sendNative("chat", {
+          text: `${formContext}\n\nUser wants to: ${args}\n\nPlease respond with ONLY the field values to fill in this exact format, one per line:\nfield_name=value\n\nDo not include any other text, just the field=value pairs.`,
+          stream: true,
+        });
+
+        if (res?.ok && res.response) {
+          // Parse Claude's response for field=value pairs
+          const lines = res.response.split("\n");
+          const fillResults: string[] = [];
+
+          for (const line of lines) {
+            const fillMatch = line.match(/^([^=]+)=(.+)$/);
+            if (fillMatch) {
+              const fieldName = fillMatch[1].trim().toLowerCase();
+              const value = fillMatch[2].trim();
+
+              // Find and fill the field
+              for (const form of formsResponse.forms) {
+                for (const formField of form.fields) {
+                  const fName = (formField.name || formField.label || "").toLowerCase();
+                  if (fName.includes(fieldName) || fieldName.includes(fName)) {
+                    const fillResponse = await chrome.tabs.sendMessage(activeTab.id, {
+                      type: "fillFormField",
+                      selector: formField.selector,
+                      value,
+                    });
+                    if (fillResponse?.ok) {
+                      fillResults.push(`Filled **${formField.label || formField.name}** with "${value}"`);
+                    }
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
+          if (fillResults.length > 0) {
+            setMessages((prev) => [...prev, { role: "assistant", text: fillResults.join("\n") }]);
+          } else {
+            setMessages((prev) => [...prev, { role: "assistant", text: "Could not parse fill instructions from Claude's response." }]);
+          }
+        } else {
+          setMessages((prev) => [...prev, { role: "assistant", text: `Error: ${res?.error || "Unknown"}` }]);
+        }
+      }
+    } catch (e: any) {
+      setMessages((prev) => [...prev, { role: "assistant", text: `Error filling form: ${e.message}` }]);
+    } finally {
+      setLoading(false);
+      setCurrentStatus(null);
+    }
+  }, []);
+
+  // Submit command - submit a form with confirmation
+  const handleSubmitCommand = useCallback(async (args: string) => {
+    setMessages((prev) => [...prev, { role: "user", text: `/submit${args ? " " + args : ""}` }]);
+
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!activeTab?.id) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "No active tab found." }]);
+        return;
+      }
+
+      // Get forms to find the one to submit
+      const formsResponse = await chrome.tabs.sendMessage(activeTab.id, { type: "getFormFields" });
+
+      if (!formsResponse?.ok || !formsResponse.forms?.length) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "No forms found on this page." }]);
+        return;
+      }
+
+      // Find the form to submit
+      let targetForm = formsResponse.forms[0]; // Default to first form
+
+      if (args.trim()) {
+        // Try to find a form matching the argument
+        const argLower = args.toLowerCase().trim();
+        const found = formsResponse.forms.find((f: any) =>
+          f.id.toLowerCase().includes(argLower) ||
+          (f.action && f.action.toLowerCase().includes(argLower))
+        );
+        if (found) {
+          targetForm = found;
+        }
+      }
+
+      // Show confirmation dialog
+      setPendingSubmit({
+        selector: targetForm.selector,
+        action: targetForm.action,
+        method: targetForm.method,
+        tabId: activeTab.id,
+      });
+
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Ready to submit form:\n- **Action:** ${targetForm.action}\n- **Method:** ${targetForm.method}\n\nClick "Confirm Submit" below to proceed, or "Cancel" to abort.`
+      }]);
+    } catch (e: any) {
+      setMessages((prev) => [...prev, { role: "assistant", text: `Error: ${e.message}` }]);
+    }
+  }, []);
+
+  // Confirm form submission
+  const confirmSubmit = useCallback(async () => {
+    if (!pendingSubmit) return;
+
+    setLoading(true);
+    setCurrentStatus("Submitting form...");
+
+    try {
+      const response = await chrome.tabs.sendMessage(pendingSubmit.tabId, {
+        type: "submitForm",
+        selector: pendingSubmit.selector,
+      });
+
+      if (response?.ok) {
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: `Form submitted successfully to \`${pendingSubmit.action}\``
+        }]);
+      } else {
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: `Failed to submit: ${response?.error || "Unknown error"}`
+        }]);
+      }
+    } catch (e: any) {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Error submitting form: ${e.message}`
+      }]);
+    } finally {
+      setPendingSubmit(null);
+      setLoading(false);
+      setCurrentStatus(null);
+    }
+  }, [pendingSubmit]);
+
+  // Cancel form submission
+  const cancelSubmit = useCallback(() => {
+    setPendingSubmit(null);
+    setMessages((prev) => [...prev, { role: "assistant", text: "Form submission cancelled." }]);
+  }, []);
+
+  // Forms command - list forms on current page
+  const handleFormsCommand = useCallback(async () => {
+    setMessages((prev) => [...prev, { role: "user", text: "/forms" }]);
+    setLoading(true);
+    setCurrentStatus("Reading forms...");
+
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab?.id) {
+        const response = await chrome.tabs.sendMessage(activeTab.id, { type: "getFormFields" });
+
+        if (response?.ok && response.forms) {
+          if (response.forms.length === 0) {
+            setMessages((prev) => [...prev, {
+              role: "assistant",
+              text: "No forms found on this page."
+            }]);
+          } else {
+            // Format forms nicely
+            let formText = `Found **${response.forms.length} form(s)** on this page:\n\n`;
+
+            response.forms.forEach((form: any, i: number) => {
+              formText += `### Form ${i + 1}: ${form.id}\n`;
+              formText += `- Action: \`${form.action}\`\n`;
+              formText += `- Method: \`${form.method}\`\n`;
+              formText += `- Fields:\n`;
+
+              form.fields.forEach((field: any) => {
+                const required = field.required ? " *(required)*" : "";
+                const label = field.label || field.name || field.placeholder || "unnamed";
+                formText += `  - **${label}**${required}: \`${field.type}\``;
+                if (field.value) {
+                  formText += ` = "${field.value}"`;
+                }
+                formText += `\n`;
+              });
+              formText += "\n";
+            });
+
+            formText += "\n*Tip: Ask me to fill a form, e.g., \"Fill the contact form with my email test@example.com\"*";
+
+            setMessages((prev) => [...prev, { role: "assistant", text: formText }]);
+          }
+        } else {
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `Error reading forms: ${response?.error || "Unknown error"}`
+          }]);
+        }
+      } else {
+        setMessages((prev) => [...prev, { role: "assistant", text: "No active tab found." }]);
+      }
+    } catch (e: any) {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Error reading forms: ${e.message}`
+      }]);
+    } finally {
+      setLoading(false);
+      setCurrentStatus(null);
+    }
+  }, []);
+
   // Page content command
   const handlePageCommand = useCallback(async () => {
     setMessages((prev) => [...prev, { role: "user", text: "/page" }]);
@@ -680,6 +993,54 @@ export function ChatView() {
       setCurrentStatus(null);
     }
   }, []);
+
+  // Fetch page context for context awareness toggle
+  const fetchPageContext = useCallback(async () => {
+    setContextLoading(true);
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab?.id) {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: activeTab.id },
+          func: () => {
+            const title = document.title;
+            const url = window.location.href;
+            // Get main content text (truncated for context)
+            const article = document.querySelector("article") || document.querySelector("main") || document.body;
+            const text = article?.innerText?.slice(0, 5000) || "";
+            return { title, url, text };
+          },
+        });
+
+        const pageData = results[0]?.result;
+        if (pageData) {
+          setPageContext(pageData);
+        } else {
+          setPageContext(null);
+        }
+      } else {
+        setPageContext(null);
+      }
+    } catch (e) {
+      console.error("Failed to fetch page context:", e);
+      setPageContext(null);
+    } finally {
+      setContextLoading(false);
+    }
+  }, []);
+
+  // Toggle context awareness
+  const toggleContext = useCallback(async () => {
+    if (!contextEnabled) {
+      // Turning ON - fetch current page context
+      setContextEnabled(true);
+      await fetchPageContext();
+    } else {
+      // Turning OFF - clear context
+      setContextEnabled(false);
+      setPageContext(null);
+    }
+  }, [contextEnabled, fetchPageContext]);
 
   // Remember command - add to memory
   const handleRememberCommand = useCallback(async (args: string) => {
@@ -774,6 +1135,24 @@ export function ChatView() {
         description: "Analyze current page",
         handler: handlePageCommand,
       },
+      {
+        name: "forms",
+        aliases: ["f"],
+        description: "List forms on page",
+        handler: handleFormsCommand,
+      },
+      {
+        name: "fill",
+        aliases: [],
+        description: "Fill form fields",
+        handler: handleFillCommand,
+      },
+      {
+        name: "submit",
+        aliases: [],
+        description: "Submit a form",
+        handler: handleSubmitCommand,
+      },
     ],
     [
       handleBriefingCommand,
@@ -786,6 +1165,9 @@ export function ChatView() {
       handleIntegrationsCommand,
       handleWorkflowsCommand,
       handlePageCommand,
+      handleFormsCommand,
+      handleFillCommand,
+      handleSubmitCommand,
     ]
   );
 
@@ -849,17 +1231,31 @@ export function ChatView() {
       return;
     }
 
-    // Build display text with attachment info
+    // Build display text with attachment and context info
     const attachmentNames = attachments.map(a => a.name);
-    const displayText = attachmentNames.length > 0
-      ? `${text}\n\n*Attached: ${attachmentNames.join(", ")}*`
-      : text;
+    let displayText = text;
+    const displayParts: string[] = [];
+    if (attachmentNames.length > 0) {
+      displayParts.push(`Attached: ${attachmentNames.join(", ")}`);
+    }
+    if (contextEnabled && pageContext) {
+      displayParts.push(`Context: ${pageContext.title}`);
+    }
+    if (displayParts.length > 0) {
+      displayText = `${text}\n\n*${displayParts.join(" | ")}*`;
+    }
 
     // Prepare attachments for API
     const attachmentsPayload = attachments.map(a => ({
       name: a.name,
       content: a.content,
     }));
+
+    // Build the actual message text with page context prepended
+    let messageText = text;
+    if (contextEnabled && pageContext) {
+      messageText = `[Page Context]\nTitle: ${pageContext.title}\nURL: ${pageContext.url}\n\n${pageContext.text.slice(0, 3000)}\n\n---\n\nUser message: ${text}`;
+    }
 
     setInput("");
     setMessages((prev) => [...prev, { role: "user", text: displayText }]);
@@ -872,7 +1268,7 @@ export function ChatView() {
     startElapsedTimer();
     try {
       const res = await sendNative("chat", {
-        text,
+        text: messageText,
         stream: true,
         attachments: attachmentsPayload,
         memoryProjectId: activeMemoryProject?.id || null,
@@ -1257,6 +1653,36 @@ export function ChatView() {
                 )}
               </div>
             )}
+            {/* Form Submit Confirmation */}
+            {pendingSubmit && (
+              <div className="glass-card mr-8 rounded-lg p-3 text-sm border border-yellow-500/30">
+                <div className="flex items-center gap-2 mb-2">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-yellow-400">
+                    <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495ZM10 5a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 10 5Zm0 9a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clipRule="evenodd" />
+                  </svg>
+                  <span className="text-yellow-400 font-medium">Confirm Form Submission</span>
+                </div>
+                <p className="text-xs text-lily-muted mb-3">
+                  This will submit the form to: <code className="text-lily-text">{pendingSubmit.action}</code>
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={confirmSubmit}
+                    disabled={loading}
+                    className="flex-1 px-3 py-2 rounded-lg bg-lily-accent text-white hover:bg-lily-hover disabled:opacity-50 transition-colors text-sm font-medium"
+                  >
+                    Confirm Submit
+                  </button>
+                  <button
+                    onClick={cancelSubmit}
+                    disabled={loading}
+                    className="px-3 py-2 rounded-lg glass-card text-lily-muted hover:text-lily-text transition-colors text-sm"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
             <div ref={bottomRef} />
           </div>
 
@@ -1309,6 +1735,37 @@ export function ChatView() {
                     </button>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {/* Page context preview */}
+            {contextEnabled && pageContext && (
+              <div className="flex items-center gap-1.5 px-2 py-1 mb-2 glass-card rounded-lg text-xs bg-lily-accent/10 border border-lily-accent/30">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 text-lily-accent flex-shrink-0">
+                  <path fillRule="evenodd" d="M4.25 5.5a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h8.5a.75.75 0 0 0 .75-.75v-4a.75.75 0 0 1 1.5 0v4A2.25 2.25 0 0 1 12.75 17h-8.5A2.25 2.25 0 0 1 2 14.75v-8.5A2.25 2.25 0 0 1 4.25 4h5a.75.75 0 0 1 0 1.5h-5Z" clipRule="evenodd" />
+                  <path fillRule="evenodd" d="M6.194 12.753a.75.75 0 0 0 1.06.053L16.5 4.44v2.81a.75.75 0 0 0 1.5 0v-4.5a.75.75 0 0 0-.75-.75h-4.5a.75.75 0 0 0 0 1.5h2.553l-9.056 8.194a.75.75 0 0 0-.053 1.06Z" clipRule="evenodd" />
+                </svg>
+                <span className="text-lily-accent truncate max-w-[200px]" title={pageContext.title}>
+                  {pageContext.title}
+                </span>
+                <button
+                  onClick={() => fetchPageContext()}
+                  className="text-lily-muted hover:text-lily-accent ml-1"
+                  title="Refresh context"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                    <path fillRule="evenodd" d="M13.836 2.477a.75.75 0 0 1 .75.75v3.182a.75.75 0 0 1-.75.75h-3.182a.75.75 0 0 1 0-1.5h1.37l-.84-.841a4.5 4.5 0 0 0-7.08.932.75.75 0 0 1-1.3-.75 6 6 0 0 1 9.44-1.242l.842.84V3.227a.75.75 0 0 1 .75-.75Zm-.911 7.5A.75.75 0 0 1 13.199 11a6 6 0 0 1-9.44 1.241l-.84-.84v1.371a.75.75 0 0 1-1.5 0V9.591a.75.75 0 0 1 .75-.75H5.35a.75.75 0 0 1 0 1.5H3.98l.841.841a4.5 4.5 0 0 0 7.08-.932.75.75 0 0 1 1.025-.273Z" clipRule="evenodd" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => { setContextEnabled(false); setPageContext(null); }}
+                  className="text-lily-muted hover:text-lily-accent ml-1"
+                  title="Remove context"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                    <path d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z" />
+                  </svg>
+                </button>
               </div>
             )}
 
@@ -1491,6 +1948,23 @@ export function ChatView() {
                 title={activeMemoryProject ? `Memory: ${activeMemoryProject.name}` : "Select Memory Project"}
               >
                 <span className="text-sm">🧠</span>
+              </button>
+
+              {/* Page Context Toggle */}
+              <button
+                onClick={toggleContext}
+                disabled={contextLoading}
+                className={`p-2 rounded-lg glass-card transition-colors ${
+                  contextEnabled
+                    ? "text-lily-accent ring-1 ring-lily-accent"
+                    : "text-lily-muted hover:text-lily-accent"
+                } ${contextLoading ? "opacity-50" : ""}`}
+                title={contextEnabled ? `Context: ${pageContext?.title || "Loading..."}` : "Include page context"}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
+                  <path fillRule="evenodd" d="M4.25 5.5a.75.75 0 0 0-.75.75v8.5c0 .414.336.75.75.75h8.5a.75.75 0 0 0 .75-.75v-4a.75.75 0 0 1 1.5 0v4A2.25 2.25 0 0 1 12.75 17h-8.5A2.25 2.25 0 0 1 2 14.75v-8.5A2.25 2.25 0 0 1 4.25 4h5a.75.75 0 0 1 0 1.5h-5Z" clipRule="evenodd" />
+                  <path fillRule="evenodd" d="M6.194 12.753a.75.75 0 0 0 1.06.053L16.5 4.44v2.81a.75.75 0 0 0 1.5 0v-4.5a.75.75 0 0 0-.75-.75h-4.5a.75.75 0 0 0 0 1.5h2.553l-9.056 8.194a.75.75 0 0 0-.053 1.06Z" clipRule="evenodd" />
+                </svg>
               </button>
 
               <span className="flex-1" />

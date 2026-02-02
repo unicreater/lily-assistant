@@ -308,7 +308,7 @@ async function handleMessage(msg) {
         result = handleNewSession();
         break;
       case "endSession":
-        result = handleEndSession();
+        result = await handleEndSession();
         break;
       case "stopChat":
         result = handleStopChat();
@@ -555,12 +555,27 @@ function ensurePersistentClaudeProcess() {
     persistentClaudeSessionId = null;
     persistentClaudeBuffer = "";
 
-    // If there's an active request, notify of unexpected exit
+    // If there's an active request, notify of unexpected exit with user-friendly message
     if (wasRunning && currentStreamRequestId && streamEventCallback) {
+      let userMessage = "Claude connection lost. ";
+
+      // Translate exit codes to user-friendly messages
+      if (code === 143 || signal === "SIGTERM") {
+        userMessage += "The process was stopped. This can happen after OAuth or when restarting. Try sending your message again.";
+      } else if (code === 137 || signal === "SIGKILL") {
+        userMessage += "The process was forcefully terminated. Try sending your message again.";
+      } else if (code === 1) {
+        userMessage += "Claude CLI encountered an error. Make sure you're logged in: run 'claude' in Terminal to check.";
+      } else if (code === 127) {
+        userMessage += "Claude CLI not found. Please install it: npm install -g @anthropic-ai/claude-code";
+      } else {
+        userMessage += `Process exited unexpectedly (code=${code}). Try sending your message again.`;
+      }
+
       streamEventCallback({
         id: currentStreamRequestId,
         type: "claude-event",
-        event: { type: "error", error: `Claude process exited (code=${code}, signal=${signal})` },
+        event: { type: "error", error: userMessage },
       });
       currentStreamRequestId = null;
       streamEventCallback = null;
@@ -569,10 +584,16 @@ function ensurePersistentClaudeProcess() {
 
   persistentClaudeProc.on("error", (err) => {
     if (currentStreamRequestId && streamEventCallback) {
+      let userMessage = "Failed to start Claude. ";
+      if (err.message.includes("ENOENT")) {
+        userMessage += "Claude CLI not found. Please install it: npm install -g @anthropic-ai/claude-code";
+      } else {
+        userMessage += err.message;
+      }
       streamEventCallback({
         id: currentStreamRequestId,
         type: "claude-event",
-        event: { type: "error", error: err.message },
+        event: { type: "error", error: userMessage },
       });
     }
     persistentClaudeProc = null;

@@ -287,6 +287,132 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: true, title, url, text, description });
     return true;
   }
+
+  // Get all forms and their fields on the page
+  if (message.type === "getFormFields") {
+    const forms = document.querySelectorAll("form");
+    const formData: any[] = [];
+
+    forms.forEach((form, formIndex) => {
+      const formInfo: any = {
+        id: form.id || `form-${formIndex}`,
+        selector: getSelector(form),
+        action: form.action || window.location.href,
+        method: form.method || "GET",
+        fields: [],
+      };
+
+      // Get all form elements
+      const elements = form.querySelectorAll("input, textarea, select");
+      elements.forEach((el) => {
+        const element = el as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+
+        // Skip hidden, submit, and button types
+        if (element.type === "hidden" || element.type === "submit" || element.type === "button") {
+          return;
+        }
+
+        // Find label
+        let label = "";
+        const labelEl = element.labels?.[0] || document.querySelector(`label[for="${element.id}"]`);
+        if (labelEl) {
+          label = labelEl.textContent?.trim() || "";
+        } else if (element.placeholder) {
+          label = element.placeholder;
+        } else if (element.getAttribute("aria-label")) {
+          label = element.getAttribute("aria-label") || "";
+        }
+
+        formInfo.fields.push({
+          name: element.name || element.id || "",
+          type: element.type || element.tagName.toLowerCase(),
+          value: element.value || "",
+          label,
+          required: element.required,
+          selector: getSelector(element),
+          placeholder: (element as HTMLInputElement).placeholder || "",
+        });
+      });
+
+      if (formInfo.fields.length > 0) {
+        formData.push(formInfo);
+      }
+    });
+
+    sendResponse({ ok: true, forms: formData, pageUrl: window.location.href });
+    return true;
+  }
+
+  // Fill a form field
+  if (message.type === "fillFormField") {
+    const { selector, value } = message;
+    try {
+      const element = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+      if (!element) {
+        sendResponse({ ok: false, error: `Element not found: ${selector}` });
+        return true;
+      }
+
+      if (element.tagName === "SELECT") {
+        // Handle select dropdown
+        const select = element as HTMLSelectElement;
+        // Try to find option by value or text
+        let found = false;
+        for (const option of Array.from(select.options)) {
+          if (option.value === value || option.textContent?.trim().toLowerCase() === value.toLowerCase()) {
+            select.value = option.value;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          sendResponse({ ok: false, error: `Option not found: ${value}` });
+          return true;
+        }
+      } else if (element.type === "checkbox" || element.type === "radio") {
+        // Handle checkbox/radio
+        (element as HTMLInputElement).checked = value === "true" || value === "1" || value === element.value;
+      } else {
+        // Handle text inputs
+        element.value = value;
+      }
+
+      // Dispatch events to trigger any listeners
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event("change", { bubbles: true }));
+      element.dispatchEvent(new Event("blur", { bubbles: true }));
+
+      sendResponse({ ok: true, filled: { selector, value } });
+    } catch (e: any) {
+      sendResponse({ ok: false, error: e.message });
+    }
+    return true;
+  }
+
+  // Submit a form
+  if (message.type === "submitForm") {
+    const { selector } = message;
+    try {
+      const form = document.querySelector(selector) as HTMLFormElement;
+      if (!form) {
+        sendResponse({ ok: false, error: `Form not found: ${selector}` });
+        return true;
+      }
+
+      // Find and click submit button, or call submit directly
+      const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]') as HTMLElement;
+      if (submitBtn) {
+        submitBtn.click();
+      } else {
+        form.submit();
+      }
+
+      sendResponse({ ok: true, submitted: true, action: form.action });
+    } catch (e: any) {
+      sendResponse({ ok: false, error: e.message });
+    }
+    return true;
+  }
 });
 
 console.log("[Lily] Content script loaded");
