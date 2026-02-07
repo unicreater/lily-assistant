@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { FilesView } from "~components/FilesView";
+import { FormsView } from "~components/FormsView";
 import { GoalsView } from "~components/GoalsView";
 import { HistoryView } from "~components/HistoryView";
 import { IntegrationsView } from "~components/IntegrationsView";
@@ -7,8 +9,22 @@ import { SkillsView } from "~components/SkillsView";
 import { SlashCommandMenu } from "~components/SlashCommandMenu";
 import { ThoughtDumpView } from "~components/ThoughtDumpView";
 import { WorkflowsView } from "~components/WorkflowsView";
+import { ActiveWorkflowsView } from "~components/ActiveWorkflowsView";
+import { SettingsView } from "~components/SettingsView";
+import { PageAnalysisView } from "~components/PageAnalysisView";
 import { ToolCall, type ToolUseBlock, type ToolResultBlock } from "~components/ToolCall";
 import { useSlashCommands, type SlashCommand } from "~hooks/useSlashCommands";
+import {
+  SUPPORTED_EXTENSIONS,
+  SENSITIVE_PATTERNS,
+  MAX_FILE_SIZE,
+  MAX_TOTAL_SIZE,
+  getFileExtension,
+  formatFileSize,
+  isSensitiveFile,
+  readFileContent,
+  getFileTypeIcon,
+} from "~lib/fileParser";
 
 interface Message {
   role: "user" | "assistant";
@@ -47,25 +63,12 @@ interface Attachment {
   size: number;
 }
 
-// Supported text file extensions
-const SUPPORTED_EXTENSIONS = new Set([
-  // Text
-  ".txt", ".md",
-  // Data
-  ".json", ".csv", ".xml", ".yaml", ".yml", ".toml",
-  // Code
-  ".js", ".ts", ".jsx", ".tsx", ".py", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".rb", ".php",
-  // Web
-  ".html", ".css",
-  // Shell
-  ".sh", ".bash", ".zsh",
-]);
+interface ExtractedItem {
+  type: "facts" | "people";
+  content: string;
+  selected: boolean;
+}
 
-// Sensitive file patterns to warn about
-const SENSITIVE_PATTERNS = [".env", ".pem", ".key", "credentials", "secret", "password"];
-
-const MAX_FILE_SIZE = 500 * 1024; // 500 KB per file
-const MAX_TOTAL_SIZE = 1024 * 1024; // 1 MB total
 
 interface Session {
   id: string;
@@ -76,7 +79,48 @@ interface Session {
   hasContext?: boolean;
 }
 
-type Tab = "chat" | "memory" | "skills" | "integrations" | "workflows" | "goals" | "history";
+// Auto-fill types
+interface FormField {
+  name: string;
+  type: string;
+  value: string;
+  label: string;
+  required: boolean;
+  selector: string;
+  placeholder: string;
+}
+
+interface TemplateField {
+  key: string;
+  label: string;
+  value: string;
+  aliases: string[];
+}
+
+interface FormTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  isDefault?: boolean;
+  fields: TemplateField[];
+}
+
+interface AutoFillAnalysis {
+  canFill: { field: FormField; templateField: TemplateField }[];
+  needsInput: FormField[];
+  confidence: number;
+  template: FormTemplate;
+}
+
+interface FieldMappingState {
+  formFields: FormField[];
+  templates: { id: string; name: string; fields: TemplateField[] }[];
+  selectedTemplateId: string | null;
+  mappings: Map<string, string>; // formField.selector -> templateField.key
+  tabId: number;
+}
+
+type Tab = "chat" | "analysis" | "memory" | "skills" | "forms" | "files" | "integrations" | "workflows" | "active" | "goals" | "history" | "settings";
 
 async function sendNative(action: string, payload: any = {}): Promise<any> {
   return chrome.runtime.sendMessage({ type: "native", action, payload });
@@ -341,6 +385,12 @@ export function ChatView() {
   });
   const [historyIndex, setHistoryIndex] = useState(-1);
 
+  // Memory consolidation state
+  const [showConsolidation, setShowConsolidation] = useState(false);
+  const [extractedItems, setExtractedItems] = useState<ExtractedItem[]>([]);
+  const [consolidationLoading, setConsolidationLoading] = useState(false);
+  const [consolidationSummary, setConsolidationSummary] = useState("");
+
   // Streaming tool calls (accumulated during response)
   const [streamingToolCalls, setStreamingToolCalls] = useState<ToolUseBlock[]>([]);
   const [streamingToolResults, setStreamingToolResults] = useState<Map<string, ToolResultBlock>>(new Map());
@@ -352,6 +402,22 @@ export function ChatView() {
 
   // Form submission confirmation
   const [pendingSubmit, setPendingSubmit] = useState<{ selector: string; action: string; method: string; tabId: number } | null>(null);
+  // Auto-fill confirmation
+  const [pendingAutoFill, setPendingAutoFill] = useState<AutoFillAnalysis | null>(null);
+  // Field mapping mode (when auto-match fails)
+  const [fieldMapping, setFieldMapping] = useState<FieldMappingState | null>(null);
+  // Template picker for /autofill with no args
+  const [showTemplatePicker, setShowTemplatePicker] = useState(false);
+  const [templatePickerList, setTemplatePickerList] = useState<{ id: string; name: string; fieldCount: number; isDefault: boolean }[]>([]);
+  // Templates for slash command menu autocomplete
+  const [menuTemplates, setMenuTemplates] = useState<{ id: string; name: string; fieldCount: number; isDefault: boolean }[]>([]);
+  // Smart template suggestion
+  const [templateSuggestion, setTemplateSuggestion] = useState<{
+    template: { id: string; name: string };
+    matchCount: number;
+    totalFields: number;
+    dismissed: boolean;
+  } | null>(null);
 
   // Persist history to localStorage
   useEffect(() => {
@@ -490,22 +556,6 @@ export function ChatView() {
   }, []);
 
   // File attachment handlers
-  const getFileExtension = (filename: string): string => {
-    const lastDot = filename.lastIndexOf(".");
-    return lastDot >= 0 ? filename.slice(lastDot).toLowerCase() : "";
-  };
-
-  const isSensitiveFile = (filename: string): boolean => {
-    const lower = filename.toLowerCase();
-    return SENSITIVE_PATTERNS.some(pattern => lower.includes(pattern));
-  };
-
-  const formatFileSize = (bytes: number): string => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
-
   const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -520,7 +570,7 @@ export function ChatView() {
       // Check extension
       const ext = getFileExtension(file.name);
       if (!SUPPORTED_EXTENSIONS.has(ext)) {
-        setAttachmentError(`Unsupported file type: ${ext || "no extension"}. Text files only.`);
+        setAttachmentError(`Unsupported file type: ${ext || "no extension"}. Supported: text, code, PDF, DOCX.`);
         continue;
       }
 
@@ -551,17 +601,26 @@ export function ChatView() {
         if (!confirmed) continue;
       }
 
-      // Read file content
+      // Read file content (supports PDF, DOCX, and text files)
       try {
-        const content = await file.text();
+        const content = await readFileContent(file);
         newAttachments.push({
           name: file.name,
           type: file.type || "text/plain",
           content,
           size: file.size,
         });
+
+        // Track file in ~/lily/files/
+        sendNative("saveFile", {
+          name: file.name,
+          content,
+          type: "upload",
+          mimeType: file.type || "text/plain",
+          sessionId: activeSession?.id,
+        }).catch((e) => console.error("Failed to track file:", e));
       } catch (err) {
-        setAttachmentError(`Failed to read "${file.name}". Make sure it's a valid text file.`);
+        setAttachmentError(`Failed to read "${file.name}". The file may be corrupted or unsupported.`);
       }
     }
 
@@ -607,6 +666,121 @@ export function ChatView() {
     }
   }, [startElapsedTimer, stopElapsedTimer]);
 
+  // Finalize session (called after consolidation or when skipping)
+  const finalizeSession = useCallback(async () => {
+    const res = await sendNative("endSession");
+    if (res?.ok) {
+      setMessages([]);
+      setActiveSession(null);
+    }
+    return res;
+  }, []);
+
+  // Start consolidation flow - extract memories for review
+  const startConsolidation = useCallback(async () => {
+    // Build conversation text from messages
+    const conversationText = messages
+      .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
+      .join("\n\n");
+
+    if (!conversationText.trim() || messages.length < 2) {
+      // No meaningful conversation, just end directly
+      await finalizeSession();
+      setMessages([{ role: "assistant", text: "Session ended.\n\nStart a new conversation anytime." }]);
+      setLoading(false);
+      return;
+    }
+
+    setCurrentStatus("Extracting memories...");
+
+    try {
+      const extractRes = await sendNative("extractMemoriesPreview", {
+        conversationText,
+        projectId: activeMemoryProject?.id || null,
+      });
+
+      setLoading(false);
+      setCurrentStatus(null);
+
+      if (extractRes?.ok) {
+        // Always show consolidation UI — with summary and optional checklist
+        setConsolidationSummary(extractRes.summary || "Session completed.");
+        setExtractedItems(
+          (extractRes.items || [])
+            .filter((item: any) => item.type && item.content)
+            .map((item: any) => ({
+              type: item.type,
+              content: item.content,
+              selected: true,
+            }))
+        );
+        setShowConsolidation(true);
+      } else {
+        // Extraction failed, end directly
+        await finalizeSession();
+        setMessages([{ role: "assistant", text: "Session ended.\n\nStart a new conversation anytime." }]);
+      }
+    } catch (e: any) {
+      setLoading(false);
+      setCurrentStatus(null);
+      // On error, still end the session
+      await finalizeSession();
+      setMessages([{ role: "assistant", text: "Session ended.\n\nStart a new conversation anytime." }]);
+    }
+  }, [messages, activeMemoryProject, finalizeSession]);
+
+  // Confirm consolidation - save selected items
+  const handleConsolidationConfirm = useCallback(async () => {
+    setConsolidationLoading(true);
+
+    try {
+      const selectedItems = extractedItems
+        .filter((i) => i.selected)
+        .map((i) => ({ type: i.type, content: i.content }));
+
+      if (selectedItems.length > 0) {
+        await sendNative("saveExtractedMemories", {
+          items: selectedItems,
+          projectId: activeMemoryProject?.id || null,
+          dateTag: new Date().toISOString().slice(0, 10),
+        });
+
+        // Fire-and-forget: update memory summary in background
+        if (activeMemoryProject?.id) {
+          sendNative("updateMemorySummary", {
+            projectId: activeMemoryProject.id,
+            newItems: selectedItems,
+          }).catch(() => {});
+        }
+      }
+
+      await finalizeSession();
+      setShowConsolidation(false);
+      setExtractedItems([]);
+      setConsolidationSummary("");
+      setConsolidationLoading(false);
+      setMessages([{
+        role: "assistant",
+        text: `Session ended. ${selectedItems.length} memor${selectedItems.length === 1 ? "y" : "ies"} saved${activeMemoryProject ? ` to "${activeMemoryProject.name}"` : ""}.`,
+      }]);
+    } catch (e: any) {
+      setConsolidationLoading(false);
+      setShowConsolidation(false);
+      setConsolidationSummary("");
+      await finalizeSession();
+      setMessages([{ role: "assistant", text: "Session ended.\n\nStart a new conversation anytime." }]);
+    }
+  }, [extractedItems, activeMemoryProject, finalizeSession]);
+
+  // Skip consolidation
+  const handleConsolidationSkip = useCallback(async () => {
+    setShowConsolidation(false);
+    setExtractedItems([]);
+    setConsolidationSummary("");
+    await finalizeSession();
+    setMessages([{ role: "assistant", text: "Session ended.\n\nStart a new conversation anytime." }]);
+  }, [finalizeSession]);
+
   const handleEndCommand = useCallback(async () => {
     // Clear input immediately
     setInput("");
@@ -614,24 +788,11 @@ export function ChatView() {
 
     // Show loading state
     setMessages((prev) => [...prev, { role: "user", text: "/end" }]);
-    setMessages((prev) => [...prev, { role: "assistant", text: "Saving session..." }]);
+    setMessages((prev) => [...prev, { role: "assistant", text: "Ending session..." }]);
     setLoading(true);
 
-    const res = await sendNative("endSession");
-    setLoading(false);
-
-    if (res?.ok) {
-      setMessages([]);
-      setActiveSession(null);
-      setMessages([{ role: "assistant", text: "Session saved. Memories extracted.\n\nStart a new conversation anytime." }]);
-    } else {
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[updated.length - 1] = { role: "assistant", text: `Failed to save session: ${res?.error || "Unknown error"}` };
-        return updated;
-      });
-    }
-  }, [clearAttachments]);
+    await startConsolidation();
+  }, [clearAttachments, startConsolidation]);
 
   const handleDumpCommand = useCallback(() => {
     setShowDump(true);
@@ -640,6 +801,7 @@ export function ChatView() {
   // Navigation commands
   const handleMemoryCommand = useCallback(() => setTab("memory"), []);
   const handleSkillsCommand = useCallback(() => setTab("skills"), []);
+  const handleFormsTabCommand = useCallback(() => setTab("forms"), []);
   const handleIntegrationsCommand = useCallback(() => setTab("integrations"), []);
   const handleWorkflowsCommand = useCallback(() => setTab("workflows"), []);
 
@@ -885,6 +1047,356 @@ export function ChatView() {
     setMessages((prev) => [...prev, { role: "assistant", text: "Form submission cancelled." }]);
   }, []);
 
+  // Auto-fill analysis helper
+  const analyzeFormForAutoFill = (forms: { fields: FormField[] }[], template: FormTemplate): AutoFillAnalysis => {
+    const analysis: AutoFillAnalysis = {
+      canFill: [],
+      needsInput: [],
+      confidence: 0,
+      template,
+    };
+
+    // Normalize a string for matching: lowercase, remove special chars, collapse spaces
+    const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+
+    // Extract key terms from a field label (e.g., "Ticker Symbol *" -> ["ticker", "symbol"])
+    const extractTerms = (s: string) => normalize(s).split(" ").filter((t) => t.length > 2);
+
+    for (const form of forms) {
+      for (const field of form.fields) {
+        // Combine all identifying info about the field
+        const fieldText = [field.name, field.label, field.placeholder].filter(Boolean).join(" ");
+        const fieldNorm = normalize(fieldText);
+        const fieldTerms = extractTerms(fieldText);
+
+        // Find matching template field by aliases
+        const matchedTemplateField = template.fields.find((tf) => {
+          // Check each alias
+          for (const alias of tf.aliases) {
+            const aliasNorm = normalize(alias);
+            const aliasTerms = extractTerms(alias);
+
+            // Direct substring match (either direction)
+            if (fieldNorm.includes(aliasNorm) || aliasNorm.includes(fieldNorm)) {
+              return true;
+            }
+
+            // Term overlap match - if any key term matches
+            for (const term of aliasTerms) {
+              if (fieldTerms.some((ft) => ft.includes(term) || term.includes(ft))) {
+                return true;
+              }
+            }
+          }
+
+          // Also check the template field's label and key
+          const labelNorm = normalize(tf.label);
+          const keyNorm = normalize(tf.key);
+          if (fieldNorm.includes(labelNorm) || labelNorm.includes(fieldNorm)) {
+            return true;
+          }
+          if (fieldNorm.includes(keyNorm) || keyNorm.includes(fieldNorm)) {
+            return true;
+          }
+
+          return false;
+        });
+
+        if (matchedTemplateField && matchedTemplateField.value) {
+          analysis.canFill.push({ field, templateField: matchedTemplateField });
+        } else {
+          analysis.needsInput.push(field);
+        }
+      }
+    }
+
+    const total = analysis.canFill.length + analysis.needsInput.length;
+    analysis.confidence = total > 0 ? analysis.canFill.length / total : 0;
+    return analysis;
+  };
+
+  // Auto-fill command
+  const handleAutoFillCommand = useCallback(async (args: string) => {
+    const templateName = args.trim() || undefined;
+    setMessages((prev) => [...prev, { role: "user", text: `/autofill${templateName ? ` ${templateName}` : ""}` }]);
+    setLoading(true);
+    setCurrentStatus("Analyzing form...");
+
+    try {
+      // 1. Get forms from page
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!activeTab?.id) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "No active tab found." }]);
+        return;
+      }
+
+      const formsResponse = await chrome.tabs.sendMessage(activeTab.id, { type: "getFormFields" });
+      if (!formsResponse?.ok || !formsResponse.forms?.length) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "No forms found on this page." }]);
+        return;
+      }
+
+      // 2. Get templates
+      const templatesRes = await sendNative("listFormTemplates");
+      if (!templatesRes?.ok || !templatesRes.templates?.length) {
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: "No form templates found. Go to the **Forms** tab to create a template with your info.",
+        }]);
+        return;
+      }
+
+      // 3. Select template (by name, show picker if no name provided, or use only template)
+      let templateSummary;
+      if (templateName) {
+        templateSummary = templatesRes.templates.find((t: any) =>
+          t.name.toLowerCase() === templateName.toLowerCase() || t.id === templateName
+        );
+        if (!templateSummary) {
+          const available = templatesRes.templates.map((t: any) => t.name).join(", ");
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            text: `Template "${templateName}" not found. Available: ${available}`,
+          }]);
+          return;
+        }
+      } else if (templatesRes.templates.length === 1) {
+        // Only one template - use it directly
+        templateSummary = templatesRes.templates[0];
+      } else {
+        // Multiple templates and no name specified - show picker
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: "Select a template to auto-fill this form:",
+        }]);
+        setTemplatePickerList(templatesRes.templates.map((t: any) => ({
+          id: t.id,
+          name: t.name,
+          fieldCount: t.fieldCount,
+          isDefault: t.isDefault,
+        })));
+        setShowTemplatePicker(true);
+        setLoading(false);
+        setCurrentStatus(null);
+        return;
+      }
+
+      // Get full template
+      const fullTemplateRes = await sendNative("getFormTemplate", { templateId: templateSummary.id });
+      if (!fullTemplateRes?.ok) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "Failed to load template." }]);
+        return;
+      }
+
+      const template: FormTemplate = fullTemplateRes.template;
+
+      // 4. Analyze what can be filled
+      const analysis = analyzeFormForAutoFill(formsResponse.forms, template);
+
+      // 5. Check if we have good matches or need manual mapping
+      if (analysis.canFill.length > 0) {
+        // Good matches - show preview and confirmation
+        let previewText = `**Form Analysis** (using "${template.name}"):\n\n`;
+        previewText += `**Will auto-fill (${analysis.canFill.length} fields):**\n`;
+        for (const item of analysis.canFill) {
+          previewText += `- ${item.field.label || item.field.name}: "${item.templateField.value}"\n`;
+        }
+
+        if (analysis.needsInput.length > 0) {
+          previewText += `\n**Unmatched fields (${analysis.needsInput.length}):**\n`;
+          for (const field of analysis.needsInput) {
+            previewText += `- ${field.label || field.name} (${field.type})\n`;
+          }
+        }
+
+        previewText += `\n**Match confidence:** ${Math.round(analysis.confidence * 100)}%`;
+        setMessages((prev) => [...prev, { role: "assistant", text: previewText }]);
+        setPendingAutoFill(analysis);
+      } else {
+        // No matches - show field mapping UI
+        const allFormFields: FormField[] = [];
+        for (const form of formsResponse.forms) {
+          allFormFields.push(...form.fields);
+        }
+
+        // Get all templates with their full details for mapping
+        const templatesWithFields: { id: string; name: string; fields: TemplateField[] }[] = [];
+        for (const t of templatesRes.templates) {
+          const fullRes = await sendNative("getFormTemplate", { templateId: t.id });
+          if (fullRes?.ok) {
+            templatesWithFields.push({
+              id: fullRes.template.id,
+              name: fullRes.template.name,
+              fields: fullRes.template.fields,
+            });
+          }
+        }
+
+        setMessages((prev) => [...prev, {
+          role: "assistant",
+          text: `**No automatic matches found.** The form has ${allFormFields.length} fields but none matched your template aliases.\n\nUse the mapping tool below to manually connect form fields to your template values.`,
+        }]);
+
+        setFieldMapping({
+          formFields: allFormFields,
+          templates: templatesWithFields,
+          selectedTemplateId: template.id,
+          mappings: new Map(),
+          tabId: activeTab.id,
+        });
+      }
+    } catch (e: any) {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Auto-fill failed: ${e.message}`,
+      }]);
+    } finally {
+      setLoading(false);
+      setCurrentStatus(null);
+    }
+  }, []);
+
+  // Execute auto-fill
+  const executeAutoFill = useCallback(async () => {
+    if (!pendingAutoFill) return;
+    setLoading(true);
+    setCurrentStatus("Filling form...");
+
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!activeTab?.id) {
+        setMessages((prev) => [...prev, { role: "assistant", text: "No active tab found." }]);
+        return;
+      }
+
+      let filled = 0;
+      for (const item of pendingAutoFill.canFill) {
+        try {
+          const response = await chrome.tabs.sendMessage(activeTab.id, {
+            type: "fillFormField",
+            selector: item.field.selector,
+            value: item.templateField.value,
+          });
+          if (response?.ok) {
+            filled++;
+          }
+        } catch (e) {
+          console.error("Failed to fill field:", item.field.selector, e);
+        }
+      }
+
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Filled **${filled}/${pendingAutoFill.canFill.length}** fields from "${pendingAutoFill.template.name}".`,
+      }]);
+    } catch (e: any) {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Auto-fill failed: ${e.message}`,
+      }]);
+    } finally {
+      setPendingAutoFill(null);
+      setLoading(false);
+      setCurrentStatus(null);
+    }
+  }, [pendingAutoFill]);
+
+  // Cancel auto-fill
+  const cancelAutoFill = useCallback(() => {
+    setPendingAutoFill(null);
+    setMessages((prev) => [...prev, { role: "assistant", text: "Auto-fill cancelled." }]);
+  }, []);
+
+  // Select template from picker and execute autofill
+  const selectTemplateFromPicker = useCallback(async (templateId: string) => {
+    setShowTemplatePicker(false);
+    setTemplatePickerList([]);
+    // Call handleAutoFillCommand with the selected template name
+    const template = templatePickerList.find((t) => t.id === templateId);
+    if (template) {
+      // Execute autofill with selected template
+      handleAutoFillCommand(template.name);
+    }
+  }, [templatePickerList, handleAutoFillCommand]);
+
+  // Cancel template picker
+  const cancelTemplatePicker = useCallback(() => {
+    setShowTemplatePicker(false);
+    setTemplatePickerList([]);
+    setMessages((prev) => [...prev, { role: "assistant", text: "Template selection cancelled." }]);
+  }, []);
+
+  // Field mapping handlers
+  const updateFieldMapping = useCallback((formFieldSelector: string, templateFieldKey: string | null) => {
+    setFieldMapping((prev) => {
+      if (!prev) return null;
+      const newMappings = new Map(prev.mappings);
+      if (templateFieldKey) {
+        newMappings.set(formFieldSelector, templateFieldKey);
+      } else {
+        newMappings.delete(formFieldSelector);
+      }
+      return { ...prev, mappings: newMappings };
+    });
+  }, []);
+
+  const selectMappingTemplate = useCallback((templateId: string) => {
+    setFieldMapping((prev) => {
+      if (!prev) return null;
+      return { ...prev, selectedTemplateId: templateId, mappings: new Map() };
+    });
+  }, []);
+
+  const executeMappedFill = useCallback(async () => {
+    if (!fieldMapping || !fieldMapping.selectedTemplateId) return;
+
+    const template = fieldMapping.templates.find((t) => t.id === fieldMapping.selectedTemplateId);
+    if (!template) return;
+
+    setLoading(true);
+    setCurrentStatus("Filling form...");
+
+    try {
+      let filled = 0;
+      for (const [selector, templateKey] of fieldMapping.mappings) {
+        const templateField = template.fields.find((f) => f.key === templateKey);
+        if (!templateField || !templateField.value) continue;
+
+        try {
+          const response = await chrome.tabs.sendMessage(fieldMapping.tabId, {
+            type: "fillFormField",
+            selector,
+            value: templateField.value,
+          });
+          if (response?.ok) {
+            filled++;
+          }
+        } catch (e) {
+          console.error("Failed to fill field:", selector, e);
+        }
+      }
+
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Filled **${filled}/${fieldMapping.mappings.size}** fields from "${template.name}".`,
+      }]);
+    } catch (e: any) {
+      setMessages((prev) => [...prev, {
+        role: "assistant",
+        text: `Fill failed: ${e.message}`,
+      }]);
+    } finally {
+      setFieldMapping(null);
+      setLoading(false);
+      setCurrentStatus(null);
+    }
+  }, [fieldMapping]);
+
+  const cancelFieldMapping = useCallback(() => {
+    setFieldMapping(null);
+    setMessages((prev) => [...prev, { role: "assistant", text: "Field mapping cancelled." }]);
+  }, []);
+
   // Forms command - list forms on current page
   const handleFormsCommand = useCallback(async () => {
     setMessages((prev) => [...prev, { role: "user", text: "/forms" }]);
@@ -1005,9 +1517,74 @@ export function ChatView() {
           func: () => {
             const title = document.title;
             const url = window.location.href;
-            // Get main content text (truncated for context)
-            const article = document.querySelector("article") || document.querySelector("main") || document.body;
-            const text = article?.innerText?.slice(0, 5000) || "";
+
+            // Try multiple strategies to get page content
+            let text = "";
+
+            // Strategy 1: Look for semantic content containers
+            const contentSelectors = [
+              "article",
+              "main",
+              "[role='main']",
+              ".content",
+              ".main-content",
+              "#content",
+              "#main",
+              ".article",
+              ".post",
+              ".entry-content",
+            ];
+
+            for (const selector of contentSelectors) {
+              const el = document.querySelector(selector);
+              if (el && el.innerText && el.innerText.trim().length > 100) {
+                text = el.innerText;
+                break;
+              }
+            }
+
+            // Strategy 2: If no semantic container found, get all visible text
+            if (!text || text.trim().length < 100) {
+              // Get text from all visible elements, excluding scripts/styles/hidden
+              const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_TEXT,
+                {
+                  acceptNode: (node) => {
+                    const parent = node.parentElement;
+                    if (!parent) return NodeFilter.FILTER_REJECT;
+                    const tag = parent.tagName.toLowerCase();
+                    if (["script", "style", "noscript", "svg", "path"].includes(tag)) {
+                      return NodeFilter.FILTER_REJECT;
+                    }
+                    const style = window.getComputedStyle(parent);
+                    if (style.display === "none" || style.visibility === "hidden") {
+                      return NodeFilter.FILTER_REJECT;
+                    }
+                    return NodeFilter.FILTER_ACCEPT;
+                  },
+                }
+              );
+
+              const textParts: string[] = [];
+              let node;
+              while ((node = walker.nextNode())) {
+                const t = node.textContent?.trim();
+                if (t && t.length > 1) {
+                  textParts.push(t);
+                }
+              }
+              text = textParts.join(" ");
+            }
+
+            // Strategy 3: Fallback to body innerText
+            if (!text || text.trim().length < 50) {
+              text = document.body?.innerText || "";
+            }
+
+            // Clean up whitespace
+            text = text.replace(/\s+/g, " ").trim().slice(0, 5000);
+
             return { title, url, text };
           },
         });
@@ -1118,6 +1695,12 @@ export function ChatView() {
         handler: handleSkillsCommand,
       },
       {
+        name: "templates",
+        aliases: ["t", "formtemplates"],
+        description: "View and manage form templates",
+        handler: handleFormsTabCommand,
+      },
+      {
         name: "integrations",
         aliases: ["int"],
         description: "Manage integrations",
@@ -1153,6 +1736,12 @@ export function ChatView() {
         description: "Submit a form",
         handler: handleSubmitCommand,
       },
+      {
+        name: "autofill",
+        aliases: ["af", "auto"],
+        description: "Auto-fill forms with saved templates",
+        handler: handleAutoFillCommand,
+      },
     ],
     [
       handleBriefingCommand,
@@ -1162,17 +1751,20 @@ export function ChatView() {
       handleForgetCommand,
       handleMemoryCommand,
       handleSkillsCommand,
+      handleFormsTabCommand,
       handleIntegrationsCommand,
       handleWorkflowsCommand,
       handlePageCommand,
       handleFormsCommand,
       handleFillCommand,
       handleSubmitCommand,
+      handleAutoFillCommand,
     ]
   );
 
   const {
     showMenu,
+    setShowMenu,
     selectedIndex,
     filteredCommands,
     handleInputChange: handleSlashInput,
@@ -1180,6 +1772,152 @@ export function ChatView() {
     selectCommand,
     parseCommand,
   } = useSlashCommands({ commands: slashCommands });
+
+  // Load templates when slash menu opens (for autocomplete)
+  useEffect(() => {
+    if (showMenu) {
+      sendNative("listFormTemplates").then((res) => {
+        if (res?.ok && res.templates) {
+          setMenuTemplates(res.templates.map((t: any) => ({
+            id: t.id,
+            name: t.name,
+            fieldCount: t.fieldCount,
+            isDefault: t.isDefault,
+          })));
+        }
+      }).catch(() => {
+        setMenuTemplates([]);
+      });
+    }
+  }, [showMenu]);
+
+  // Handle template selection from slash menu
+  const handleMenuTemplateSelect = useCallback((templateName: string) => {
+    setShowMenu(false);
+    setInput("");
+    handleAutoFillCommand(templateName);
+  }, [handleAutoFillCommand, setShowMenu]);
+
+  // Detect forms on page and suggest best matching template
+  useEffect(() => {
+    if (tab !== "chat") return;
+    if (templateSuggestion?.dismissed) return;
+
+    const detectAndSuggest = async () => {
+      try {
+        // Get active tab
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab?.id) return;
+
+        // Get forms from page
+        const formsResponse = await chrome.tabs.sendMessage(tab.id, { type: "getFormFields" });
+        if (!formsResponse?.ok || !formsResponse.forms?.length) {
+          setTemplateSuggestion(null);
+          return;
+        }
+
+        // Get templates
+        const templatesRes = await sendNative("listFormTemplates");
+        if (!templatesRes?.ok || !templatesRes.templates?.length) {
+          setTemplateSuggestion(null);
+          return;
+        }
+
+        // Collect all form fields
+        const allFormFields: FormField[] = [];
+        for (const form of formsResponse.forms) {
+          allFormFields.push(...form.fields);
+        }
+
+        if (allFormFields.length === 0) {
+          setTemplateSuggestion(null);
+          return;
+        }
+
+        // Normalize helper
+        const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+        const extractTerms = (s: string) => normalize(s).split(" ").filter((t) => t.length > 2);
+
+        // Score each template
+        let bestTemplate: { id: string; name: string } | null = null;
+        let bestMatchCount = 0;
+
+        for (const tSummary of templatesRes.templates) {
+          // Get full template
+          const fullRes = await sendNative("getFormTemplate", { templateId: tSummary.id });
+          if (!fullRes?.ok) continue;
+          const template = fullRes.template;
+
+          // Count matches
+          let matchCount = 0;
+          for (const field of allFormFields) {
+            const fieldText = [field.name, field.label, field.placeholder].filter(Boolean).join(" ");
+            const fieldNorm = normalize(fieldText);
+            const fieldTerms = extractTerms(fieldText);
+
+            const matched = template.fields.some((tf: TemplateField) => {
+              if (!tf.value) return false;
+              for (const alias of tf.aliases) {
+                const aliasNorm = normalize(alias);
+                const aliasTerms = extractTerms(alias);
+                if (fieldNorm.includes(aliasNorm) || aliasNorm.includes(fieldNorm)) return true;
+                for (const term of aliasTerms) {
+                  if (fieldTerms.some((ft: string) => ft.includes(term) || term.includes(ft))) return true;
+                }
+              }
+              const labelNorm = normalize(tf.label);
+              const keyNorm = normalize(tf.key);
+              if (fieldNorm.includes(labelNorm) || labelNorm.includes(fieldNorm)) return true;
+              if (fieldNorm.includes(keyNorm) || keyNorm.includes(fieldNorm)) return true;
+              return false;
+            });
+
+            if (matched) matchCount++;
+          }
+
+          if (matchCount > bestMatchCount) {
+            bestMatchCount = matchCount;
+            bestTemplate = { id: template.id, name: template.name };
+          }
+        }
+
+        // Show suggestion if confidence > 60%
+        const confidence = allFormFields.length > 0 ? bestMatchCount / allFormFields.length : 0;
+        if (bestTemplate && confidence >= 0.6) {
+          setTemplateSuggestion({
+            template: bestTemplate,
+            matchCount: bestMatchCount,
+            totalFields: allFormFields.length,
+            dismissed: false,
+          });
+        } else {
+          setTemplateSuggestion(null);
+        }
+      } catch (e) {
+        // Silently fail - suggestion is optional
+        setTemplateSuggestion(null);
+      }
+    };
+
+    detectAndSuggest();
+  }, [tab, templateSuggestion?.dismissed]);
+
+  // Handle suggestion actions
+  const handleSuggestionFill = useCallback(() => {
+    if (templateSuggestion) {
+      handleAutoFillCommand(templateSuggestion.template.name);
+      setTemplateSuggestion(null);
+    }
+  }, [templateSuggestion, handleAutoFillCommand]);
+
+  const handleSuggestionOther = useCallback(() => {
+    setTemplateSuggestion(null);
+    handleAutoFillCommand("");
+  }, [handleAutoFillCommand]);
+
+  const dismissSuggestion = useCallback(() => {
+    setTemplateSuggestion((prev) => prev ? { ...prev, dismissed: true } : null);
+  }, []);
 
   // Load active session on mount
   useEffect(() => {
@@ -1400,27 +2138,7 @@ export function ChatView() {
 
   const handleEndSession = async () => {
     setLoading(true);
-    try {
-      const res = await sendNative("endSession");
-      if (res?.ok) {
-        setMessages([]);
-        setActiveSession(null);
-        // Show success message briefly
-        setMessages([{ role: "assistant", text: "Session ended. Memories saved." }]);
-      } else {
-        setMessages((prev) => [...prev, {
-          role: "assistant",
-          text: `Failed to end session: ${res?.error || "Unknown error"}`
-        }]);
-      }
-    } catch (e: any) {
-      setMessages((prev) => [...prev, {
-        role: "assistant",
-        text: `Error ending session: ${e.message}`
-      }]);
-    } finally {
-      setLoading(false);
-    }
+    await startConsolidation();
   };
 
   // Handler for integration auth - switches to chat and sends auth prompt
@@ -1482,20 +2200,22 @@ export function ChatView() {
     }
   };
 
-  const tabs: { key: Tab; label: string; icon?: string }[] = [
-    { key: "chat", label: "Chat" },
-    { key: "memory", label: "Memory", icon: "🧠" },
-    { key: "skills", label: "Skills", icon: "⚡" },
-    { key: "history", label: "History" },
+  const railTabs: { key: Tab; icon: string; label: string }[] = [
+    { key: "chat", icon: "💬", label: "Chat" },
+    { key: "analysis", icon: "🔍", label: "Page Analysis" },
+    { key: "memory", icon: "🧠", label: "Memory" },
+    { key: "forms", icon: "📝", label: "Forms" },
+    { key: "files", icon: "📁", label: "Files" },
+    { key: "skills", icon: "⚡", label: "Skills" },
+    { key: "history", icon: "📖", label: "History" },
+    { key: "integrations", icon: "🔌", label: "Integrations" },
+    { key: "workflows", icon: "🎬", label: "Workflows" },
+    { key: "active", icon: "🔄", label: "Active" },
   ];
 
-  const moreTabs: { key: Tab; label: string; icon?: string }[] = [
-    { key: "integrations", label: "Integrations", icon: "🔌" },
-    { key: "workflows", label: "Workflows", icon: "🎬" },
-    { key: "goals", label: "Goals" },
+  const railBottomTabs: { key: Tab; icon: string; label: string }[] = [
+    { key: "settings", icon: "⚙", label: "Settings" },
   ];
-
-  const [showMoreMenu, setShowMoreMenu] = useState(false);
 
   // If thought dump is open, show it instead
   if (showDump) {
@@ -1503,64 +2223,70 @@ export function ChatView() {
   }
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 h-full">
-      {/* Tab bar - sticky at top */}
-      <div className="sticky top-0 z-20 flex border-b border-lily-border glass">
-        {tabs.map((t) => (
+    <div className="flex-1 flex min-h-0 h-full">
+      {/* Rail - vertical icon sidebar */}
+      <div
+        className="flex flex-col items-center py-3 gap-1 flex-shrink-0 glass"
+        style={{ width: 46, borderRadius: 0, borderTop: 0, borderBottom: 0, borderLeft: 0 }}
+      >
+        {railTabs.map((t) => (
           <button
             key={t.key}
             onClick={() => setTab(t.key)}
-            className={`flex-1 py-2 text-xs font-medium transition-colors ${
+            title={t.label}
+            className={`w-[36px] h-[36px] flex items-center justify-center rounded-lg text-base transition-all relative ${
               tab === t.key
-                ? "text-lily-accent border-b-2 border-lily-accent"
-                : "text-lily-muted hover:text-lily-text"
+                ? "text-lily-accent"
+                : "text-lily-muted hover:text-lily-text hover:bg-white/5"
             }`}
+            style={tab === t.key ? { background: "var(--lily-accent-subtle)" } : undefined}
           >
-            {t.icon ? `${t.icon} ` : ""}{t.label}
+            {tab === t.key && (
+              <span
+                className="absolute left-0 top-[8px] bottom-[8px] rounded-r-sm rail-indicator"
+                style={{ width: 3, background: "var(--lily-accent)" }}
+              />
+            )}
+            {t.icon}
           </button>
         ))}
-        {/* More menu button */}
-        <div className="relative">
+        <div className="flex-1" />
+        {railBottomTabs.map((t) => (
           <button
-            onClick={() => setShowMoreMenu(!showMoreMenu)}
-            className={`px-3 py-2 text-xs font-medium transition-colors ${
-              moreTabs.some(t => t.key === tab)
-                ? "text-lily-accent border-b-2 border-lily-accent"
-                : "text-lily-muted hover:text-lily-text"
+            key={t.key}
+            onClick={() => setTab(t.key)}
+            title={t.label}
+            className={`w-[36px] h-[36px] flex items-center justify-center rounded-lg text-base transition-all relative ${
+              tab === t.key
+                ? "text-lily-accent"
+                : "text-lily-muted hover:text-lily-text hover:bg-white/5"
             }`}
+            style={tab === t.key ? { background: "var(--lily-accent-subtle)" } : undefined}
           >
-            More ▾
+            {tab === t.key && (
+              <span
+                className="absolute left-0 top-[8px] bottom-[8px] rounded-r-sm rail-indicator"
+                style={{ width: 3, background: "var(--lily-accent)" }}
+              />
+            )}
+            {t.icon}
           </button>
-          {showMoreMenu && (
-            <div className="absolute right-0 top-full z-50 mt-1 w-40 glass-card rounded-lg shadow-lg py-1">
-              {moreTabs.map((t) => (
-                <button
-                  key={t.key}
-                  onClick={() => {
-                    setTab(t.key);
-                    setShowMoreMenu(false);
-                  }}
-                  className={`w-full text-left px-3 py-2 text-xs transition-colors flex items-center gap-2 ${
-                    tab === t.key
-                      ? "text-lily-accent bg-lily-accent/10"
-                      : "text-lily-muted hover:text-lily-text hover:bg-lily-border/20"
-                  }`}
-                >
-                  {t.icon && <span>{t.icon}</span>}
-                  {t.label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        ))}
       </div>
 
-      {tab === "goals" && <GoalsView />}
-      {tab === "history" && <HistoryView onResume={handleResumeSession} />}
-      {tab === "memory" && <MemoryView />}
-      {tab === "skills" && <SkillsView />}
-      {tab === "integrations" && <IntegrationsView onStartAuthChat={handleStartAuthChat} />}
-      {tab === "workflows" && <WorkflowsView />}
+      {/* Content panel */}
+      <div className="flex-1 flex flex-col min-w-0 min-h-0">
+        {tab === "goals" && <GoalsView />}
+        {tab === "history" && <HistoryView onResume={handleResumeSession} />}
+        {tab === "memory" && <MemoryView />}
+        {tab === "forms" && <FormsView />}
+        {tab === "files" && <FilesView />}
+        {tab === "skills" && <SkillsView />}
+        {tab === "integrations" && <IntegrationsView onStartAuthChat={handleStartAuthChat} />}
+        {tab === "workflows" && <WorkflowsView />}
+        {tab === "active" && <ActiveWorkflowsView />}
+        {tab === "settings" && <SettingsView />}
+        {tab === "analysis" && <PageAnalysisView />}
 
       {tab === "chat" && (
         <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
@@ -1586,7 +2312,47 @@ export function ChatView() {
           )}
 
           {/* Messages - scrollable area */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
+            {/* Smart Template Suggestion Banner */}
+            {templateSuggestion && !templateSuggestion.dismissed && (
+              <div className="glass-card rounded-lg p-3 border border-green-500/30 mb-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                    <span className="text-lg">💡</span>
+                    <div className="min-w-0">
+                      <p className="text-sm text-lily-text">
+                        Form detected! Fill with <strong className="text-green-400">{templateSuggestion.template.name}</strong>?
+                      </p>
+                      <p className="text-xs text-lily-muted">
+                        {templateSuggestion.matchCount}/{templateSuggestion.totalFields} fields match
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={dismissSuggestion}
+                    className="text-lily-muted hover:text-lily-text p-1 flex-shrink-0"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+                      <path d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z" />
+                    </svg>
+                  </button>
+                </div>
+                <div className="flex gap-2 mt-2">
+                  <button
+                    onClick={handleSuggestionFill}
+                    className="flex-1 px-3 py-1.5 rounded-lg bg-green-500 text-white text-xs font-medium hover:bg-green-600 transition-colors"
+                  >
+                    Fill Now
+                  </button>
+                  <button
+                    onClick={handleSuggestionOther}
+                    className="px-3 py-1.5 rounded-lg glass-card text-lily-muted text-xs hover:text-lily-text transition-colors"
+                  >
+                    Other Templates
+                  </button>
+                </div>
+              </div>
+            )}
             {messages.length === 0 && !activeSession && (
               <p className="text-sm text-lily-muted text-center mt-8">
                 Send a message to start a new conversation with Lily.
@@ -1600,10 +2366,10 @@ export function ChatView() {
             {messages.map((m, i) => (
               <div
                 key={i}
-                className={`rounded-lg p-3 text-sm overflow-hidden ${
+                className={`p-3 text-sm overflow-hidden msg-enter ${
                   m.role === "user"
-                    ? "glass-card ml-8"
-                    : "glass mr-8"
+                    ? "msg-user ml-8"
+                    : "msg-assistant mr-8"
                 }`}
               >
                 {m.role === "user" ? (
@@ -1629,7 +2395,7 @@ export function ChatView() {
               </div>
             ))}
             {loading && (
-              <div className="glass mr-8 rounded-lg p-3 text-sm">
+              <div className="msg-assistant mr-8 p-3 text-sm">
                 {/* Streaming tool calls */}
                 {streamingToolCalls.length > 0 && (
                   <div className="mb-3">
@@ -1651,6 +2417,37 @@ export function ChatView() {
                     <span className="text-lily-accent">{formatElapsed(elapsedSeconds)}</span>
                   </span>
                 )}
+              </div>
+            )}
+            {/* Auto-Fill Confirmation */}
+            {pendingAutoFill && (
+              <div className="glass-card mr-8 rounded-lg p-3 text-sm border border-green-500/30">
+                <div className="flex items-center gap-2 mb-2">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-green-400">
+                    <path fillRule="evenodd" d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.857-9.809a.75.75 0 0 0-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 1 0-1.06 1.061l2.5 2.5a.75.75 0 0 0 1.137-.089l4-5.5Z" clipRule="evenodd" />
+                  </svg>
+                  <span className="text-green-400 font-medium">Ready to Auto-Fill</span>
+                  <span className="text-xs text-lily-muted">({pendingAutoFill.template.name})</span>
+                </div>
+                <p className="text-xs text-lily-muted mb-3">
+                  Will fill {pendingAutoFill.canFill.length} field{pendingAutoFill.canFill.length !== 1 ? "s" : ""} from your template.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={executeAutoFill}
+                    disabled={loading}
+                    className="flex-1 px-3 py-2 rounded-lg bg-green-500 text-white hover:bg-green-600 disabled:opacity-50 transition-colors text-sm font-medium"
+                  >
+                    Fill Now
+                  </button>
+                  <button
+                    onClick={cancelAutoFill}
+                    disabled={loading}
+                    className="px-3 py-2 rounded-lg glass-card text-lily-muted hover:text-lily-text transition-colors text-sm"
+                  >
+                    Cancel
+                  </button>
+                </div>
               </div>
             )}
             {/* Form Submit Confirmation */}
@@ -1675,6 +2472,122 @@ export function ChatView() {
                   </button>
                   <button
                     onClick={cancelSubmit}
+                    disabled={loading}
+                    className="px-3 py-2 rounded-lg glass-card text-lily-muted hover:text-lily-text transition-colors text-sm"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+            {/* Template Picker UI */}
+            {showTemplatePicker && templatePickerList.length > 0 && (
+              <div className="glass-card mr-8 rounded-lg p-3 text-sm border border-lily-accent/30">
+                <div className="flex items-center gap-2 mb-3">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-lily-accent">
+                    <path fillRule="evenodd" d="M3.5 2A1.5 1.5 0 0 0 2 3.5V15a3 3 0 1 0 6 0V3.5A1.5 1.5 0 0 0 6.5 2h-3Zm11.753 6.99a.75.75 0 0 0-.75-.75h-5.5a.75.75 0 0 0 0 1.5h5.5a.75.75 0 0 0 .75-.75Zm0-2.5a.75.75 0 0 0-.75-.75h-5.5a.75.75 0 0 0 0 1.5h5.5a.75.75 0 0 0 .75-.75Zm0 5a.75.75 0 0 0-.75-.75h-5.5a.75.75 0 0 0 0 1.5h5.5a.75.75 0 0 0 .75-.75Zm0 2.5a.75.75 0 0 0-.75-.75h-5.5a.75.75 0 0 0 0 1.5h5.5a.75.75 0 0 0 .75-.75Z" clipRule="evenodd" />
+                  </svg>
+                  <span className="text-lily-accent font-medium">Select Template</span>
+                </div>
+                <div className="space-y-2 mb-3">
+                  {templatePickerList.map((template) => (
+                    <button
+                      key={template.id}
+                      onClick={() => selectTemplateFromPicker(template.id)}
+                      className="w-full glass-card rounded-lg p-2 text-left hover:ring-1 hover:ring-lily-accent transition-all flex items-center justify-between gap-2"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {template.isDefault && (
+                          <span className="text-yellow-400 text-xs">★</span>
+                        )}
+                        <span className="text-sm truncate">{template.name}</span>
+                      </div>
+                      <span className="text-xs text-lily-muted flex-shrink-0">{template.fieldCount} fields</span>
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={cancelTemplatePicker}
+                  className="w-full px-3 py-2 rounded-lg glass-card text-lily-muted hover:text-lily-text transition-colors text-sm"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+            {/* Field Mapping UI */}
+            {fieldMapping && (
+              <div className="glass-card mr-8 rounded-lg p-3 text-sm border border-blue-500/30">
+                <div className="flex items-center gap-2 mb-3">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-blue-400">
+                    <path fillRule="evenodd" d="M3.25 3A2.25 2.25 0 0 0 1 5.25v9.5A2.25 2.25 0 0 0 3.25 17h13.5A2.25 2.25 0 0 0 19 14.75v-9.5A2.25 2.25 0 0 0 16.75 3H3.25ZM2.5 9v5.75c0 .414.336.75.75.75h13.5a.75.75 0 0 0 .75-.75V9h-15Zm14.25 4a.75.75 0 0 1-.75.75H4a.75.75 0 0 1 0-1.5h12a.75.75 0 0 1 .75.75Zm0-2.5a.75.75 0 0 1-.75.75H4a.75.75 0 0 1 0-1.5h12a.75.75 0 0 1 .75.75Z" clipRule="evenodd" />
+                  </svg>
+                  <span className="text-blue-400 font-medium">Map Form Fields</span>
+                </div>
+
+                {/* Template selector */}
+                <div className="mb-3">
+                  <label className="text-xs text-lily-muted block mb-1">Use template:</label>
+                  <select
+                    value={fieldMapping.selectedTemplateId || ""}
+                    onChange={(e) => selectMappingTemplate(e.target.value)}
+                    className="w-full glass-card text-lily-text rounded px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-blue-400"
+                  >
+                    <option value="">Select a template...</option>
+                    {fieldMapping.templates.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name} ({t.fields.length} fields)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Field mappings */}
+                {fieldMapping.selectedTemplateId && (
+                  <div className="space-y-2 mb-3 max-h-48 overflow-y-auto">
+                    <p className="text-xs text-lily-muted">Map each form field to a template value:</p>
+                    {fieldMapping.formFields.map((field) => {
+                      const selectedTemplate = fieldMapping.templates.find((t) => t.id === fieldMapping.selectedTemplateId);
+                      const currentMapping = fieldMapping.mappings.get(field.selector);
+                      const mappedField = selectedTemplate?.fields.find((f) => f.key === currentMapping);
+
+                      return (
+                        <div key={field.selector} className="flex items-center gap-2">
+                          <div className="flex-1 min-w-0">
+                            <span className="text-xs truncate block">{field.label || field.name || field.placeholder || "Unknown"}</span>
+                            <span className="text-[10px] text-lily-muted">({field.type})</span>
+                          </div>
+                          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 text-lily-muted flex-shrink-0">
+                            <path fillRule="evenodd" d="M2 8a.75.75 0 0 1 .75-.75h8.69L8.22 4.03a.75.75 0 0 1 1.06-1.06l4.5 4.5a.75.75 0 0 1 0 1.06l-4.5 4.5a.75.75 0 0 1-1.06-1.06l3.22-3.22H2.75A.75.75 0 0 1 2 8Z" clipRule="evenodd" />
+                          </svg>
+                          <select
+                            value={currentMapping || ""}
+                            onChange={(e) => updateFieldMapping(field.selector, e.target.value || null)}
+                            className={`flex-1 glass-card rounded px-2 py-1 text-xs outline-none focus:ring-1 focus:ring-blue-400 ${currentMapping ? "text-green-400" : "text-lily-muted"}`}
+                          >
+                            <option value="">Skip</option>
+                            {selectedTemplate?.fields.map((tf) => (
+                              <option key={tf.key} value={tf.key}>
+                                {tf.label}: {tf.value ? `"${tf.value.slice(0, 20)}${tf.value.length > 20 ? "..." : ""}"` : "(empty)"}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Action buttons */}
+                <div className="flex gap-2">
+                  <button
+                    onClick={executeMappedFill}
+                    disabled={loading || !fieldMapping.selectedTemplateId || fieldMapping.mappings.size === 0}
+                    className="flex-1 px-3 py-2 rounded-lg bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+                  >
+                    Fill {fieldMapping.mappings.size} Field{fieldMapping.mappings.size !== 1 ? "s" : ""}
+                  </button>
+                  <button
+                    onClick={cancelFieldMapping}
                     disabled={loading}
                     className="px-3 py-2 rounded-lg glass-card text-lily-muted hover:text-lily-text transition-colors text-sm"
                   >
@@ -1708,33 +2621,43 @@ export function ChatView() {
                   setInput("");
                   clearAttachments();
                 }}
+                templates={menuTemplates}
+                onSelectTemplate={handleMenuTemplateSelect}
               />
             )}
 
             {/* Attachment preview */}
             {attachments.length > 0 && (
               <div className="flex flex-wrap gap-2 mb-2">
-                {attachments.map((att) => (
-                  <div
-                    key={att.name}
-                    className="flex items-center gap-1.5 px-2 py-1 glass-card rounded-lg text-xs"
-                  >
-                    <span className="text-lily-accent">📄</span>
-                    <span className="text-lily-text truncate max-w-[120px]" title={att.name}>
-                      {att.name}
-                    </span>
-                    <span className="text-lily-muted">({formatFileSize(att.size)})</span>
-                    <button
-                      onClick={() => removeAttachment(att.name)}
-                      className="text-lily-muted hover:text-lily-accent ml-1"
-                      title="Remove attachment"
+                {attachments.map((att) => {
+                  const icon = getFileTypeIcon(att.name);
+                  return (
+                    <div
+                      key={att.name}
+                      className="flex items-center gap-1.5 px-2 py-1 glass-card rounded-lg text-xs"
                     >
-                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
-                        <path d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z" />
-                      </svg>
-                    </button>
-                  </div>
-                ))}
+                      <span
+                        className="inline-flex items-center justify-center w-[18px] h-[18px] rounded text-[7px] font-bold text-white flex-shrink-0"
+                        style={{ backgroundColor: icon.color }}
+                      >
+                        {icon.label}
+                      </span>
+                      <span className="text-lily-text truncate max-w-[120px]" title={att.name}>
+                        {att.name}
+                      </span>
+                      <span className="text-lily-muted">({formatFileSize(att.size)})</span>
+                      <button
+                        onClick={() => removeAttachment(att.name)}
+                        className="text-lily-muted hover:text-lily-accent ml-1"
+                        title="Remove attachment"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                          <path d="M5.28 4.22a.75.75 0 0 0-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 1 0 1.06 1.06L8 9.06l2.72 2.72a.75.75 0 1 0 1.06-1.06L9.06 8l2.72-2.72a.75.75 0 0 0-1.06-1.06L8 6.94 5.28 4.22Z" />
+                        </svg>
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             )}
 
@@ -1789,16 +2712,6 @@ export function ChatView() {
                 rows={1}
                 className="flex-1 glass-card text-lily-text rounded-lg px-3 py-2 text-sm resize-none outline-none focus:ring-1 focus:ring-lily-accent placeholder:text-lily-muted"
               />
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={loading}
-                className="px-2 py-2 rounded-lg glass-card text-lily-muted hover:text-lily-accent disabled:opacity-50 transition-colors"
-                title="Attach file"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
-                  <path fillRule="evenodd" d="M15.621 4.379a3 3 0 0 0-4.242 0l-7 7a3 3 0 0 0 4.241 4.243h.001l.497-.5a.75.75 0 0 1 1.064 1.057l-.498.501-.002.002a4.5 4.5 0 0 1-6.364-6.364l7-7a4.5 4.5 0 0 1 6.368 6.36l-3.455 3.553A2.625 2.625 0 1 1 9.52 9.52l3.45-3.451a.75.75 0 1 1 1.061 1.06l-3.45 3.451a1.125 1.125 0 0 0 1.587 1.595l3.454-3.553a3 3 0 0 0 0-4.242Z" clipRule="evenodd" />
-                </svg>
-              </button>
               {loading ? (
                 <button
                   onClick={stopChat}
@@ -1982,6 +2895,146 @@ export function ChatView() {
         </div>
       )}
 
+      {/* Memory Consolidation Modal */}
+      {showConsolidation && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="glass-card rounded-lg p-4 w-full max-w-sm max-h-[70vh] flex flex-col">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-lg font-semibold">
+                {extractedItems.length > 0 ? "Save Memories" : "Session Summary"}
+              </h3>
+              {extractedItems.length > 0 && (
+                <button
+                  onClick={handleConsolidationSkip}
+                  className="text-lily-muted hover:text-lily-text text-xs"
+                >
+                  Skip
+                </button>
+              )}
+            </div>
+
+            {activeMemoryProject && (
+              <p className="text-xs text-lily-accent mb-1">
+                Saving to: {activeMemoryProject.name}
+              </p>
+            )}
+            {!activeMemoryProject && (
+              <p className="text-xs text-lily-muted mb-1">
+                No project attached. Saving to general memory.
+              </p>
+            )}
+
+            {/* Session summary — always shown */}
+            {consolidationSummary && (
+              <div className="glass-card rounded-lg p-3 mb-3 border border-lily-accent/15">
+                <div className="text-[10px] font-semibold text-lily-muted uppercase tracking-wider mb-1">
+                  Session Summary
+                </div>
+                <p className="text-xs text-lily-text leading-relaxed">
+                  {consolidationSummary}
+                </p>
+              </div>
+            )}
+
+            {extractedItems.length > 0 && (
+              <p className="text-xs text-lily-muted mb-3">
+                Review extracted memories. Uncheck any you don't want to save.
+              </p>
+            )}
+
+            <div className="flex-1 overflow-y-auto space-y-3 min-h-0">
+              {/* Facts section */}
+              {extractedItems.some((i) => i.type === "facts") && (
+                <div>
+                  <div className="text-[10px] font-semibold text-lily-muted uppercase tracking-wider mb-1.5">
+                    Facts
+                  </div>
+                  {extractedItems.map((item, idx) =>
+                    item.type === "facts" ? (
+                      <label
+                        key={idx}
+                        className="flex items-start gap-2 p-2 rounded-lg glass-card mb-1.5 cursor-pointer hover:ring-1 hover:ring-lily-accent/30"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={item.selected}
+                          onChange={() => {
+                            const updated = [...extractedItems];
+                            updated[idx] = { ...item, selected: !item.selected };
+                            setExtractedItems(updated);
+                          }}
+                          className="mt-0.5 accent-lily-accent rounded"
+                        />
+                        <span className="text-sm flex-1">{item.content}</span>
+                      </label>
+                    ) : null
+                  )}
+                </div>
+              )}
+
+              {/* People section */}
+              {extractedItems.some((i) => i.type === "people") && (
+                <div>
+                  <div className="text-[10px] font-semibold text-lily-muted uppercase tracking-wider mb-1.5">
+                    People
+                  </div>
+                  {extractedItems.map((item, idx) =>
+                    item.type === "people" ? (
+                      <label
+                        key={idx}
+                        className="flex items-start gap-2 p-2 rounded-lg glass-card mb-1.5 cursor-pointer hover:ring-1 hover:ring-lily-accent/30"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={item.selected}
+                          onChange={() => {
+                            const updated = [...extractedItems];
+                            updated[idx] = { ...item, selected: !item.selected };
+                            setExtractedItems(updated);
+                          }}
+                          className="mt-0.5 accent-lily-accent rounded"
+                        />
+                        <span className="text-sm flex-1">{item.content}</span>
+                      </label>
+                    ) : null
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-2 mt-3">
+              {extractedItems.length > 0 ? (
+                <>
+                  <button
+                    onClick={handleConsolidationConfirm}
+                    disabled={consolidationLoading || extractedItems.filter((i) => i.selected).length === 0}
+                    className="flex-1 px-4 py-2 rounded-lg bg-lily-accent text-white text-sm hover:bg-lily-hover disabled:opacity-50 transition-colors"
+                  >
+                    {consolidationLoading
+                      ? "Saving..."
+                      : `Save ${extractedItems.filter((i) => i.selected).length} item${extractedItems.filter((i) => i.selected).length !== 1 ? "s" : ""}`}
+                  </button>
+                  <button
+                    onClick={handleConsolidationSkip}
+                    disabled={consolidationLoading}
+                    className="px-4 py-2 rounded-lg glass-card text-lily-muted text-sm hover:text-lily-text disabled:opacity-50 transition-colors"
+                  >
+                    Skip
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={handleConsolidationSkip}
+                  className="flex-1 px-4 py-2 rounded-lg bg-lily-accent text-white text-sm hover:bg-lily-hover transition-colors"
+                >
+                  End Session
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Memory Project Selector Modal */}
       {showMemoryModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
@@ -2072,6 +3125,7 @@ export function ChatView() {
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 }

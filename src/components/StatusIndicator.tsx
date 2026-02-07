@@ -6,9 +6,9 @@ export function StatusIndicator({ connected }: Props) {
   return (
     <div className="flex items-center gap-2">
       <div
-        className={`w-2.5 h-2.5 rounded-full ${
+        className={`w-[7px] h-[7px] rounded-full ${
           connected
-            ? "bg-green-400 animate-pulse-dot"
+            ? "bg-green-400 status-dot"
             : "bg-red-400"
         }`}
       />

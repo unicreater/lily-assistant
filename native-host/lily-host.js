@@ -21,6 +21,12 @@ const MEMORY_DIR = path.join(LILY_DIR, "memory");
 const MEMORY_PROJECTS_DIR = path.join(MEMORY_DIR, "projects");
 const WORKFLOWS_DIR = path.join(LILY_DIR, "workflows");
 const INTEGRATIONS_DIR = path.join(LILY_DIR, "integrations");
+const FORMS_DIR = path.join(LILY_DIR, "forms");
+const FILES_DIR = path.join(LILY_DIR, "files");
+const FILES_UPLOADS_DIR = path.join(FILES_DIR, "uploads");
+const FILES_CREATED_DIR = path.join(FILES_DIR, "created");
+const FILES_DOWNLOADS_DIR = path.join(FILES_DIR, "downloads");
+const FILES_INDEX_FILE = path.join(FILES_DIR, "index.json");
 // Starter integrations bundled with native host (copied to ~/lily/integrations on first run)
 const STARTER_INTEGRATIONS_DIR = path.join(__dirname, "starter-integrations");
 const CLAUDE_MD = path.join(LILY_DIR, "CLAUDE.md");
@@ -34,6 +40,7 @@ const GOALS_FILE = path.join(STATE_DIR, "goals.json");
 const HISTORY_FILE = path.join(STATE_DIR, "chat-history.json");
 const ACTIVE_DUMP_FILE = path.join(STATE_DIR, "active-dump.json");
 const CLAUDE_SESSION_FILE = path.join(STATE_DIR, "claude-session.json");
+const ACTIVE_WORKFLOWS_FILE = path.join(STATE_DIR, "active-workflows.json");
 const TIMEOUT_MS = 180000; // 3 minutes for longer responses
 const DUMP_AUTO_SESSION_GAP_MS = 30 * 60 * 1000; // 30 minutes
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours - sessions older than this start fresh
@@ -61,6 +68,8 @@ let persistentClaudeSessionId = null;
 let persistentClaudeBuffer = "";
 let currentStreamRequestId = null;
 let streamEventCallback = null;
+let lastMemoryProjectId = null; // Track attached project to detect changes
+let currentProcessTier = null; // null, "standard", "read", "full"
 
 // --- PATH resolution for claude binary ---
 function findClaude() {
@@ -86,7 +95,7 @@ function findClaude() {
 
 // --- Ensure directories ---
 function ensureDirs() {
-  for (const d of [LILY_DIR, SESSIONS_DIR, STATE_DIR, SKILLS_DIR, TEMPLATES_DIR, DUMPS_DIR, MEMORY_DIR, MEMORY_PROJECTS_DIR, WORKFLOWS_DIR, INTEGRATIONS_DIR]) {
+  for (const d of [LILY_DIR, SESSIONS_DIR, STATE_DIR, SKILLS_DIR, TEMPLATES_DIR, DUMPS_DIR, MEMORY_DIR, MEMORY_PROJECTS_DIR, WORKFLOWS_DIR, INTEGRATIONS_DIR, FORMS_DIR, FILES_DIR, FILES_UPLOADS_DIR, FILES_CREATED_DIR, FILES_DOWNLOADS_DIR]) {
     fs.mkdirSync(d, { recursive: true });
   }
 }
@@ -189,6 +198,8 @@ function clearClaudeSessionState() {
   claudeSessionId = null;
   claudeMdMtime = null;
   claudeSessionCreatedAt = null;
+  lastMemoryProjectId = null;
+  currentProcessTier = null;
   try {
     fs.unlinkSync(CLAUDE_SESSION_FILE);
   } catch {}
@@ -389,6 +400,15 @@ async function handleMessage(msg) {
       case "updateProjectMemory":
         result = handleUpdateProjectMemory(payload);
         break;
+      case "extractMemoriesPreview":
+        result = await handleExtractMemoriesPreview(payload);
+        break;
+      case "saveExtractedMemories":
+        result = handleSaveExtractedMemories(payload);
+        break;
+      case "updateMemorySummary":
+        result = await handleUpdateMemorySummary(payload);
+        break;
       // Skills system actions
       case "listSkills":
         result = handleListSkills();
@@ -425,6 +445,22 @@ async function handleMessage(msg) {
       case "deleteWorkflow":
         result = handleDeleteWorkflow(payload);
         break;
+      // Active workflow tracking
+      case "listActiveWorkflows":
+        result = handleListActiveWorkflows();
+        break;
+      case "activateWorkflow":
+        result = handleActivateWorkflow(payload);
+        break;
+      case "updateWorkflowStatus":
+        result = handleUpdateWorkflowStatus(payload);
+        break;
+      case "deactivateWorkflow":
+        result = handleDeactivateWorkflow(payload);
+        break;
+      case "testWorkflowStep":
+        result = handleTestWorkflowStep(payload);
+        break;
       case "runMcpSetup":
         result = await handleRunMcpSetup(payload);
         break;
@@ -439,6 +475,45 @@ async function handleMessage(msg) {
         break;
       case "refreshProcess":
         result = handleRefreshProcess();
+        break;
+      // Form template actions
+      case "listFormTemplates":
+        result = handleListFormTemplates();
+        break;
+      case "getFormTemplate":
+        result = handleGetFormTemplate(payload);
+        break;
+      case "saveFormTemplate":
+        result = handleSaveFormTemplate(payload);
+        break;
+      case "deleteFormTemplate":
+        result = handleDeleteFormTemplate(payload);
+        break;
+      // File tracking actions
+      case "listFiles":
+        result = handleListFiles(payload);
+        break;
+      case "saveFile":
+        result = handleSaveFile(payload);
+        break;
+      case "getFile":
+        result = handleGetFile(payload);
+        break;
+      case "deleteFile":
+        result = handleDeleteFile(payload);
+        break;
+      case "openFile":
+        result = handleOpenFile(payload);
+        break;
+      // Version and upgrade actions
+      case "getVersion":
+        result = handleGetVersion();
+        break;
+      case "checkForUpdates":
+        result = handleCheckForUpdates();
+        break;
+      case "performUpgrade":
+        result = await handlePerformUpgrade();
         break;
       default:
         result = { ok: false, error: `Unknown action: ${action}` };
@@ -481,9 +556,18 @@ function getClaudeEnv() {
 // Spawns a long-running Claude process that accepts stream-json input
 // This keeps MCP servers alive for OAuth and provides faster responses
 
-function ensurePersistentClaudeProcess() {
+function ensurePersistentClaudeProcess(requiredScope = "standard") {
+  // If process exists, check if current scope is sufficient
   if (persistentClaudeProc && !persistentClaudeProc.killed) {
-    return persistentClaudeProc;
+    const order = { standard: 0, read: 1, full: 2 };
+    if ((order[currentProcessTier] || 0) >= (order[requiredScope] || 0)) {
+      return persistentClaudeProc; // Current scope is sufficient
+    }
+    // Need upgrade — kill and restart with higher scope
+    const logFile = path.join(LILY_DIR, "debug.log");
+    fs.appendFileSync(logFile, `[${new Date().toISOString()}] Upgrading tool scope: ${currentProcessTier} → ${requiredScope}\n`);
+    killPersistentClaudeProcess();
+    clearClaudeSessionState();
   }
 
   const claudePath = findClaude();
@@ -493,21 +577,39 @@ function ensurePersistentClaudeProcess() {
 
   // Log startup attempt
   const logFile = path.join(LILY_DIR, "debug.log");
-  fs.appendFileSync(logFile, `[${new Date().toISOString()}] Starting persistent Claude process: ${claudePath}\n`);
+  fs.appendFileSync(logFile, `[${new Date().toISOString()}] Starting persistent Claude process: ${claudePath} (scope: ${requiredScope})\n`);
 
-  // Spawn persistent process with bidirectional stream-json
-  // NOTE: Do NOT use --print flag - that's one-shot mode and exits after response
-  // For persistent interactive mode, just use stream-json input/output
-  persistentClaudeProc = spawn(claudePath, [
+  // Build args with tool restrictions based on scope
+  const args = [
     "--input-format", "stream-json",
     "--output-format", "stream-json",
     "--verbose",
     "--permission-mode", "bypassPermissions",
-  ], {
+  ];
+
+  // Apply tool restrictions based on scope
+  const disallowed = getDisallowedTools(requiredScope);
+  if (disallowed.length > 0) {
+    args.push("--disallowedTools", disallowed.join(","));
+  }
+
+  // Behavioral reinforcement for standard scope
+  if (requiredScope === "standard") {
+    args.push("--append-system-prompt",
+      "All project data has been provided in your context. " +
+      "Do NOT attempt to read or explore files — use the context sections above. " +
+      "If the user asks about the project, answer from context only."
+    );
+  }
+
+  // Spawn persistent process with bidirectional stream-json
+  persistentClaudeProc = spawn(claudePath, args, {
     cwd: LILY_DIR,
     env: getClaudeEnv(),
     stdio: ["pipe", "pipe", "pipe"],
   });
+
+  currentProcessTier = requiredScope;
 
   fs.appendFileSync(logFile, `[${new Date().toISOString()}] Persistent process spawned, PID: ${persistentClaudeProc.pid}\n`);
 
@@ -625,8 +727,8 @@ function handlePersistentClaudeEvent(event) {
 }
 
 // Send a message to the persistent Claude process
-function sendToPersistentClaude(text, requestId, onEvent) {
-  const proc = ensurePersistentClaudeProcess();
+function sendToPersistentClaude(text, requestId, onEvent, requiredScope = "standard") {
+  const proc = ensurePersistentClaudeProcess(requiredScope);
 
   // Set up callback for this request
   currentStreamRequestId = requestId;
@@ -681,7 +783,7 @@ function handleRefreshProcess() {
 // --- Claude CLI spawn with stream-json for status updates (legacy/fallback) ---
 // Returns { result, sessionId } where sessionId is captured from the init message
 function runClaude(prompt, options = {}) {
-  const { resumeSessionId = null, onStatus = null, requestId = null } = options;
+  const { resumeSessionId = null, onStatus = null, requestId = null, requiredScope = "standard" } = options;
 
   return new Promise((resolve, reject) => {
     const claudePath = findClaude();
@@ -690,8 +792,13 @@ function runClaude(prompt, options = {}) {
     }
 
     // Build args
-    // --permission-mode bypassPermissions allows MCP tools without full filesystem access
     const args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions"];
+
+    // Apply tool restrictions based on scope
+    const disallowed = getDisallowedTools(requiredScope);
+    if (disallowed.length > 0) {
+      args.push("--disallowedTools", disallowed.join(","));
+    }
 
     // Add --resume if we have a session to resume
     if (resumeSessionId) {
@@ -934,11 +1041,97 @@ function buildAttachmentSection(attachments) {
   return section;
 }
 
+// --- Analyze message to determine context needs and tool scope ---
+function analyzeContextNeeds(text) {
+  const lower = (text || "").toLowerCase();
+  const result = {
+    needsSessionHistory: false,
+    sessionHistoryDays: 0,
+    toolScope: "standard", // "standard" | "read" | "full"
+  };
+
+  // Session history detection
+  const sessionPatterns = [
+    /\byesterday\b/, /\blast (time|session|conversation|chat)\b/,
+    /\bearlier today\b/, /\bwe (talked|discussed|spoke) about\b/,
+    /\byou (said|mentioned|told|suggested)\b/, /\bremember when\b/,
+    /\bprevious(ly)?\b/, /\bwhat did (we|you|i)\b/,
+    /\bfollow.?up on\b/, /\bcontinue (from|where)\b/,
+  ];
+  for (const p of sessionPatterns) {
+    if (p.test(lower)) {
+      result.needsSessionHistory = true;
+      result.sessionHistoryDays = /yesterday/.test(lower) ? 1
+        : /last week/.test(lower) ? 7 : 3;
+      break;
+    }
+  }
+
+  // Full access: write/edit/bash (check first — overrides read)
+  const fullPatterns = [
+    /\b(edit|modify|update|change|write|create|save|delete|remove) .{0,20}(file|document|script)/,
+    /\b(run|execute) .{0,20}(command|script|bash|terminal)/,
+    /\bsave (this|it|that) (to|as|in)\b/,
+    /\bmake (a |the )?(new )?(file|document|script)\b/,
+  ];
+  for (const p of fullPatterns) {
+    if (p.test(lower)) {
+      result.toolScope = "full";
+      return result;
+    }
+  }
+
+  // Read-only: browse/check files
+  const readPatterns = [
+    /\b(look|check|read|open|show|find|search|explore|view) .{0,20}(file|folder|directory|document)/,
+    /\bwhat.{0,10}in (my |the |~\/)/,
+    /\b(list|show) (my |the )?(files|folders|documents)/,
+    /~\//, /\/users\//, // Direct paths (lowercase since we match against lower)
+  ];
+  for (const p of readPatterns) {
+    if (p.test(lower)) {
+      result.toolScope = "read";
+      break;
+    }
+  }
+
+  return result;
+}
+
+// --- Get disallowed tools for a given scope ---
+function getDisallowedTools(scope) {
+  switch (scope) {
+    case "standard": return ["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
+    case "read":     return ["Bash", "Write", "Edit"];
+    case "full":     return [];
+    default:         return ["Bash", "Read", "Write", "Edit", "Glob", "Grep"];
+  }
+}
+
+// --- Build session history context for on-demand injection ---
+function buildSessionHistoryContext(daysBack = 3) {
+  let history = "";
+  const today = new Date();
+  for (let i = 0; i <= daysBack; i++) {
+    const date = new Date(today);
+    date.setDate(date.getDate() - i);
+    const dateStr = date.toISOString().slice(0, 10);
+    const sessionFile = path.join(SESSIONS_DIR, `${dateStr}.md`);
+    try {
+      const content = fs.readFileSync(sessionFile, "utf-8");
+      const trimmed = content.length > 3000
+        ? "...\n" + content.slice(-3000) : content;
+      history += `### ${dateStr}\n${trimmed}\n\n`;
+    } catch {}
+  }
+  return history || null;
+}
+
 // --- Build context section with state and memory ---
-function buildContextSection(memoryProjectId = null) {
+function buildContextSection(memoryProjectId = null, analysis = null) {
   let context = "";
 
-  // Add current state if exists
+  // Step 1: Add current state if exists
   try {
     const currentState = fs.readFileSync(CURRENT_STATE_FILE, "utf-8");
     if (currentState && currentState.trim()) {
@@ -946,51 +1139,89 @@ function buildContextSection(memoryProjectId = null) {
     }
   } catch {}
 
-  // Add project-specific memory if a project is selected
+  // Step 2: Always load general memory (legacy flat files)
+  try {
+    const factsContent = fs.readFileSync(FACTS_FILE, "utf-8");
+    const factItems = factsContent.split("\n").filter(l => l.startsWith("- ")).slice(0, 20);
+    if (factItems.length > 0) {
+      context += `## General Memory\n${factItems.join("\n")}\n`;
+    }
+  } catch {}
+
+  try {
+    const peopleContent = fs.readFileSync(PEOPLE_FILE, "utf-8");
+    const peopleItems = peopleContent.split("\n").filter(l => l.startsWith("- ")).slice(0, 15);
+    if (peopleItems.length > 0) {
+      context += `\n### People\n${peopleItems.join("\n")}\n`;
+    }
+  } catch {}
+
+  context += "\n---\n\n";
+
+  // Step 3: If project attached, add project-specific context
   if (memoryProjectId) {
     const projectDir = path.join(MEMORY_PROJECTS_DIR, memoryProjectId);
     if (projectDir.startsWith(MEMORY_PROJECTS_DIR) && fs.existsSync(projectDir)) {
       try {
-        // Get project name
         const meta = JSON.parse(fs.readFileSync(path.join(projectDir, "meta.json"), "utf-8"));
         const projectName = meta.name || memoryProjectId;
 
-        // Load facts
-        const facts = JSON.parse(fs.readFileSync(path.join(projectDir, "facts.json"), "utf-8") || "[]");
-        // Load people
-        const people = JSON.parse(fs.readFileSync(path.join(projectDir, "people.json"), "utf-8") || "[]");
-        // Load documents
-        const documents = JSON.parse(fs.readFileSync(path.join(projectDir, "documents.json"), "utf-8") || "[]");
+        context += `## Active Project: "${projectName}"\n`;
+        if (meta.description) {
+          context += `${meta.description}\n`;
+        }
+        context += `\n**IMPORTANT**: The user has attached this memory project to the current conversation. When they ask about "this project", "the project", "the attached project", or what you know about it — they mean THIS memory project ("${projectName}"), NOT the ~/lily/ directory or codebase. Refer ONLY to the information in this section. Do NOT explore the filesystem to describe the project.\n\n`;
 
-        if (facts.length > 0 || people.length > 0 || documents.length > 0) {
-          context += `## Memory Context: ${projectName}\n\n`;
+        // Project instructions (like Claude.ai custom instructions)
+        if (meta.instructions && meta.instructions.trim()) {
+          context += `### Project Instructions\n${meta.instructions}\n\n`;
+        }
 
+        // Load project memory — prefer narrative summary over raw items
+        let hasMemorySummary = false;
+        try {
+          const memorySummary = fs.readFileSync(path.join(projectDir, "memory.md"), "utf-8");
+          if (memorySummary && memorySummary.trim()) {
+            context += `### Project Memory\n${memorySummary}\n\n`;
+            hasMemorySummary = true;
+          }
+        } catch {}
+
+        // Fallback: if no summary, use raw facts/people lists
+        if (!hasMemorySummary) {
+          const facts = JSON.parse(fs.readFileSync(path.join(projectDir, "facts.json"), "utf-8") || "[]");
+          const people = JSON.parse(fs.readFileSync(path.join(projectDir, "people.json"), "utf-8") || "[]");
           if (facts.length > 0) {
-            context += `### Facts\n${facts.map(f => `- ${f}`).join("\n")}\n\n`;
+            context += `### Project Facts\n${facts.map(f => `- ${f}`).join("\n")}\n\n`;
           }
           if (people.length > 0) {
-            context += `### People\n${people.map(p => `- ${p}`).join("\n")}\n\n`;
+            context += `### Project People\n${people.map(p => `- ${p}`).join("\n")}\n\n`;
           }
-          if (documents.length > 0) {
-            context += `### Documents\n${documents.map(d => `- ${d}`).join("\n")}\n\n`;
-          }
-
-          context += "---\n\n";
         }
+
+        // Always include documents (separate from memory summary)
+        const documents = JSON.parse(fs.readFileSync(path.join(projectDir, "documents.json"), "utf-8") || "[]");
+        if (documents.length > 0) {
+          context += `### Project Documents\n${documents.map(d => `- ${d}`).join("\n")}\n\n`;
+        }
+
+        if (!hasMemorySummary && documents.length === 0 && (!meta.instructions || !meta.instructions.trim())) {
+          context += `*No project-specific data stored yet.*\n\n`;
+        }
+
+        context += "---\n\n";
       } catch (e) {
         // If project memory fails, continue without it
       }
     }
-  } else {
-    // Fallback to legacy flat memory (for backward compatibility)
-    try {
-      const facts = fs.readFileSync(FACTS_FILE, "utf-8");
-      // Extract just the list items (skip headers and empty lines)
-      const factItems = facts.split("\n").filter(l => l.startsWith("- ")).slice(0, 20);
-      if (factItems.length > 0) {
-        context += `## What I Remember About You\n${factItems.join("\n")}\n\n---\n\n`;
-      }
-    } catch {}
+  }
+
+  // Session history (on-demand — only when user references past conversations)
+  if (analysis && analysis.needsSessionHistory) {
+    const history = buildSessionHistoryContext(analysis.sessionHistoryDays);
+    if (history) {
+      context += `## Recent Session History\n${history}\n\n---\n\n`;
+    }
   }
 
   return context;
@@ -1035,11 +1266,21 @@ async function handleChatPersistent(payload, requestId = null) {
   const { text, stream = false, attachments = [], memoryProjectId = null } = payload || {};
   if (!text) return { ok: false, error: "Missing text" };
 
+  // Analyze message to determine context needs and tool scope
+  const analysis = analyzeContextNeeds(text);
+
   // Check if CLAUDE.md has changed - if so, restart the persistent process
   if (persistentClaudeProc && hasClaudeMdChanged()) {
     killPersistentClaudeProcess();
     clearClaudeSessionState();
   }
+
+  // Check if attached project changed - if so, restart to rebuild context
+  if (persistentClaudeSessionId && memoryProjectId !== lastMemoryProjectId) {
+    killPersistentClaudeProcess();
+    clearClaudeSessionState();
+  }
+  lastMemoryProjectId = memoryProjectId;
 
   // Start new Lily session if none active
   if (!activeSessionId) {
@@ -1066,8 +1307,14 @@ async function handleChatPersistent(payload, requestId = null) {
         }
       } catch {}
 
-      // Add state and memory context
-      prompt += buildContextSection(memoryProjectId);
+      // Add state and memory context (with analysis for conditional layers)
+      prompt += buildContextSection(memoryProjectId, analysis);
+    } else if (analysis.needsSessionHistory) {
+      // Mid-session: inject session history if user references past conversations
+      const history = buildSessionHistoryContext(analysis.sessionHistoryDays);
+      if (history) {
+        prompt += `## Recent Session History\n${history}\n\n---\n\n`;
+      }
     }
 
     // Check for skill trigger and inject skill content
@@ -1144,8 +1391,8 @@ async function handleChatPersistent(payload, requestId = null) {
     };
 
     try {
-      // Send to persistent process
-      sendToPersistentClaude(prompt, requestId, onEvent);
+      // Send to persistent process (with tool scope from message analysis)
+      sendToPersistentClaude(prompt, requestId, onEvent, analysis.toolScope);
 
       // Track active process for cancellation
       activeClaudeProc = persistentClaudeProc;
@@ -1267,8 +1514,11 @@ async function handleChat(payload, requestId = null) {
       }
     } catch {}
 
+    // Analyze message for context needs (legacy fallback uses same analysis)
+    const legacyAnalysis = analyzeContextNeeds(text);
+
     // Add state and memory context (pass memoryProjectId for project-specific context)
-    prompt += buildContextSection(memoryProjectId);
+    prompt += buildContextSection(memoryProjectId, legacyAnalysis);
 
     // Check for skill trigger and inject skill content
     const matchedSkill = matchSkillTrigger(text);
@@ -1281,7 +1531,7 @@ async function handleChat(payload, requestId = null) {
     prompt += `User: ${text}`;
 
     try {
-      const result = await runClaude(prompt, { onStatus, requestId });
+      const result = await runClaude(prompt, { onStatus, requestId, requiredScope: legacyAnalysis.toolScope });
       response = result.result;
       newSessionId = result.sessionId;
     } catch (e) {
@@ -1471,15 +1721,12 @@ async function handleEndSession() {
     activeSessionTitle = null;
     activeSessionStarted = null;
 
-    // Trigger state and memory extraction asynchronously (don't block response)
-    // This runs in the background after the session ends
+    // Update current state asynchronously (memory extraction is now handled by the UI)
     setImmediate(async () => {
       try {
         await handleUpdateCurrentState({});
-        await handleExtractMemory();
       } catch (e) {
-        // Non-fatal - just log
-        console.error("Failed to extract state/memory:", e.message);
+        console.error("Failed to update state:", e.message);
       }
     });
 
@@ -2156,6 +2403,203 @@ Rules:
   }
 }
 
+// --- Memory Consolidation Handlers ---
+
+async function handleExtractMemoriesPreview(payload) {
+  const { conversationText, projectId } = payload || {};
+
+  if (!conversationText || !conversationText.trim()) {
+    return { ok: true, items: [], summary: null };
+  }
+
+  // Load existing memories to avoid duplicates
+  let existingFacts = "";
+  let existingPeople = "";
+
+  if (projectId) {
+    // Load from project
+    const projectDir = path.join(MEMORY_PROJECTS_DIR, projectId);
+    if (projectDir.startsWith(MEMORY_PROJECTS_DIR) && fs.existsSync(projectDir)) {
+      try {
+        const facts = JSON.parse(fs.readFileSync(path.join(projectDir, "facts.json"), "utf-8") || "[]");
+        const people = JSON.parse(fs.readFileSync(path.join(projectDir, "people.json"), "utf-8") || "[]");
+        existingFacts = facts.map(f => `- ${f}`).join("\n");
+        existingPeople = people.map(p => `- ${p}`).join("\n");
+      } catch {}
+    }
+  } else {
+    // Load from legacy files
+    try { existingFacts = fs.readFileSync(FACTS_FILE, "utf-8").slice(0, 2000); } catch {}
+    try { existingPeople = fs.readFileSync(PEOPLE_FILE, "utf-8").slice(0, 1000); } catch {}
+  }
+
+  const prompt = `You are Lily, a personal AI assistant. Extract useful facts and people from the conversation to remember long-term.
+
+## Recent Conversation
+${conversationText.slice(-8000)}
+
+## Already Known (do NOT duplicate these)
+${existingFacts ? `### Existing Facts\n${existingFacts}\n` : ""}
+${existingPeople ? `### Existing People\n${existingPeople}\n` : ""}
+
+## Task
+Extract NEW facts and people worth remembering. Output JSON:
+\`\`\`json
+{
+  "items": [
+    {"type": "facts", "content": "Prefers morning meetings"},
+    {"type": "people", "content": "John from accounting - handles expense reports"}
+  ],
+  "summary": "Brief 1-2 sentence summary of conversation"
+}
+\`\`\`
+
+Rules:
+- Only extract genuinely useful, long-term facts
+- Skip temporary information (today's tasks, one-off requests, etc.)
+- Don't duplicate existing memories listed above
+- Be concise - each item should be a single clear statement
+- "type" must be either "facts" or "people"
+- ALWAYS provide a summary of the conversation, even if no items are extracted
+- If nothing worth remembering, return: {"items": [], "summary": "Brief summary of what was discussed"}`;
+
+  try {
+    const result = await runClaude(prompt, {});
+
+    // Parse the JSON response
+    const jsonMatch = result.result.match(/```json\n([\s\S]*?)\n```/);
+    if (!jsonMatch) {
+      // No JSON found — generate a basic summary from conversation
+      const firstLine = (conversationText || "").split("\n").find(l => l.startsWith("User:"));
+      const fallbackSummary = firstLine
+        ? `Conversation about: ${firstLine.replace("User: ", "").slice(0, 100)}`
+        : "General conversation.";
+      return { ok: true, items: [], summary: fallbackSummary };
+    }
+
+    const parsed = JSON.parse(jsonMatch[1]);
+    return {
+      ok: true,
+      items: (parsed.items || []).filter(i => i.type && i.content),
+      summary: parsed.summary || "General conversation.",
+    };
+  } catch (e) {
+    return { ok: true, items: [], summary: "Session ended." };
+  }
+}
+
+function handleSaveExtractedMemories(payload) {
+  const { items, projectId, dateTag } = payload || {};
+
+  if (!items || items.length === 0) {
+    return { ok: true, saved: 0 };
+  }
+
+  const tag = dateTag || new Date().toISOString().slice(0, 10);
+  let saved = 0;
+
+  for (const item of items) {
+    if (!item.type || !item.content) continue;
+
+    const taggedContent = `[${tag}] ${item.content}`;
+
+    if (projectId) {
+      // Save to project memory
+      const result = handleUpdateProjectMemory({
+        projectId,
+        type: item.type,
+        action: "add",
+        item: taggedContent,
+      });
+      if (result.ok) saved++;
+    } else {
+      // Save to legacy flat files
+      const result = handleAddMemory({
+        type: item.type,
+        fact: taggedContent,
+      });
+      if (result.ok) saved++;
+    }
+  }
+
+  return { ok: true, saved };
+}
+
+async function handleUpdateMemorySummary(payload) {
+  const { projectId, newItems = [] } = payload || {};
+  if (!projectId) return { ok: false, error: "Missing projectId" };
+
+  // Validate projectId
+  if (projectId.includes("/") || projectId.includes("..")) {
+    return { ok: false, error: "Invalid projectId" };
+  }
+
+  const projectDir = path.join(MEMORY_PROJECTS_DIR, projectId);
+  if (!projectDir.startsWith(MEMORY_PROJECTS_DIR) || !fs.existsSync(projectDir)) {
+    return { ok: false, error: "Project not found" };
+  }
+
+  // Read existing data
+  let existingSummary = "";
+  try { existingSummary = fs.readFileSync(path.join(projectDir, "memory.md"), "utf-8"); } catch {}
+
+  let allFacts = [];
+  let allPeople = [];
+  try { allFacts = JSON.parse(fs.readFileSync(path.join(projectDir, "facts.json"), "utf-8")); } catch {}
+  try { allPeople = JSON.parse(fs.readFileSync(path.join(projectDir, "people.json"), "utf-8")); } catch {}
+
+  let projectName = projectId;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(projectDir, "meta.json"), "utf-8"));
+    projectName = meta.name || projectId;
+  } catch {}
+
+  const prompt = `You are updating the memory summary for the project "${projectName}". This summary captures everything important learned across all conversations.
+
+## Existing Memory Summary
+${existingSummary || "(empty — this is the first summary)"}
+
+## All Known Facts
+${allFacts.length > 0 ? allFacts.map(f => `- ${f}`).join("\n") : "(none)"}
+
+## All Known People
+${allPeople.length > 0 ? allPeople.map(p => `- ${p}`).join("\n") : "(none)"}
+
+## Newly Added Items
+${newItems.length > 0 ? newItems.map(i => `- [${i.type}] ${i.content}`).join("\n") : "(none)"}
+
+## Task
+Write an updated memory summary that:
+1. Integrates new items naturally into the existing summary
+2. Uses concise narrative format (short paragraphs, not bullet points)
+3. Organizes by topic/theme rather than chronologically
+4. Removes redundant or outdated information when superseded by newer info
+5. Stays under 500 words
+6. Includes key people and their roles/relationships when relevant
+
+Output ONLY the updated summary text, nothing else.`;
+
+  try {
+    const result = await runClaude(prompt, {});
+    const summary = result.result.trim();
+
+    // Save the updated summary
+    fs.writeFileSync(path.join(projectDir, "memory.md"), summary, "utf-8");
+
+    // Update timestamp
+    const metaPath = path.join(projectDir, "meta.json");
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+      meta.updatedAt = new Date().toISOString();
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf-8");
+    } catch {}
+
+    return { ok: true, summary };
+  } catch (e) {
+    return { ok: false, error: `Failed to update memory summary: ${e.message}` };
+  }
+}
+
 // --- Skills System Handlers ---
 
 function parseSkillFrontmatter(content) {
@@ -2288,6 +2732,463 @@ function handleDeleteSkill(payload) {
     return { ok: true };
   } catch (e) {
     return { ok: false, error: `Failed to delete skill: ${e.message}` };
+  }
+}
+
+// --- Form Template Handlers ---
+
+// Helper to generate ID from name
+function generateTemplateId(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+// Get index of templates
+function getTemplatesIndex() {
+  const indexPath = path.join(FORMS_DIR, "index.json");
+  try {
+    return JSON.parse(fs.readFileSync(indexPath, "utf-8"));
+  } catch {
+    return { templates: [] };
+  }
+}
+
+// Save index of templates
+function saveTemplatesIndex(index) {
+  const indexPath = path.join(FORMS_DIR, "index.json");
+  fs.writeFileSync(indexPath, JSON.stringify(index, null, 2), "utf-8");
+}
+
+function handleListFormTemplates() {
+  try {
+    const index = getTemplatesIndex();
+    const templates = [];
+
+    for (const entry of index.templates) {
+      try {
+        const templatePath = path.join(FORMS_DIR, `${entry.id}.json`);
+        const template = JSON.parse(fs.readFileSync(templatePath, "utf-8"));
+        templates.push({
+          id: template.id,
+          name: template.name,
+          description: template.description || "",
+          isDefault: template.isDefault || false,
+          fieldCount: template.fields?.length || 0,
+          createdAt: template.createdAt,
+          updatedAt: template.updatedAt,
+        });
+      } catch {
+        // Skip templates that can't be read
+      }
+    }
+
+    return { ok: true, templates };
+  } catch (e) {
+    return { ok: false, error: `Failed to list templates: ${e.message}` };
+  }
+}
+
+function handleGetFormTemplate(payload) {
+  const { templateId } = payload || {};
+  if (!templateId) {
+    return { ok: false, error: "Missing templateId" };
+  }
+
+  // Validate templateId
+  if (templateId.includes("/") || templateId.includes("..")) {
+    return { ok: false, error: "Invalid templateId" };
+  }
+
+  try {
+    const templatePath = path.join(FORMS_DIR, `${templateId}.json`);
+    if (!templatePath.startsWith(FORMS_DIR)) {
+      return { ok: false, error: "Path traversal blocked" };
+    }
+
+    const template = JSON.parse(fs.readFileSync(templatePath, "utf-8"));
+    return { ok: true, template };
+  } catch (e) {
+    return { ok: false, error: `Failed to get template: ${e.message}` };
+  }
+}
+
+function handleSaveFormTemplate(payload) {
+  const { template } = payload || {};
+  if (!template || !template.name) {
+    return { ok: false, error: "Missing template or template.name" };
+  }
+
+  try {
+    const now = new Date().toISOString();
+    const index = getTemplatesIndex();
+
+    // Generate ID if new template
+    if (!template.id) {
+      template.id = generateTemplateId(template.name);
+      template.createdAt = now;
+    }
+
+    template.updatedAt = now;
+
+    // Ensure fields array exists
+    if (!template.fields) {
+      template.fields = [];
+    }
+
+    // If this template is set as default, unset others
+    if (template.isDefault) {
+      for (const entry of index.templates) {
+        if (entry.id !== template.id) {
+          try {
+            const otherPath = path.join(FORMS_DIR, `${entry.id}.json`);
+            const other = JSON.parse(fs.readFileSync(otherPath, "utf-8"));
+            if (other.isDefault) {
+              other.isDefault = false;
+              fs.writeFileSync(otherPath, JSON.stringify(other, null, 2), "utf-8");
+            }
+          } catch {}
+        }
+      }
+    }
+
+    // Save template file
+    const templatePath = path.join(FORMS_DIR, `${template.id}.json`);
+    fs.writeFileSync(templatePath, JSON.stringify(template, null, 2), "utf-8");
+
+    // Update index
+    const existingIndex = index.templates.findIndex(t => t.id === template.id);
+    if (existingIndex >= 0) {
+      index.templates[existingIndex] = { id: template.id };
+    } else {
+      index.templates.push({ id: template.id });
+    }
+    saveTemplatesIndex(index);
+
+    return { ok: true, template };
+  } catch (e) {
+    return { ok: false, error: `Failed to save template: ${e.message}` };
+  }
+}
+
+function handleDeleteFormTemplate(payload) {
+  const { templateId } = payload || {};
+  if (!templateId) {
+    return { ok: false, error: "Missing templateId" };
+  }
+
+  // Validate templateId
+  if (templateId.includes("/") || templateId.includes("..")) {
+    return { ok: false, error: "Invalid templateId" };
+  }
+
+  try {
+    const templatePath = path.join(FORMS_DIR, `${templateId}.json`);
+    if (!templatePath.startsWith(FORMS_DIR)) {
+      return { ok: false, error: "Path traversal blocked" };
+    }
+
+    // Delete file
+    fs.unlinkSync(templatePath);
+
+    // Update index
+    const index = getTemplatesIndex();
+    index.templates = index.templates.filter(t => t.id !== templateId);
+    saveTemplatesIndex(index);
+
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `Failed to delete template: ${e.message}` };
+  }
+}
+
+// --- File Tracking Handlers ---
+
+// Get files index
+function getFilesIndex() {
+  try {
+    return JSON.parse(fs.readFileSync(FILES_INDEX_FILE, "utf-8"));
+  } catch {
+    return { files: [] };
+  }
+}
+
+// Save files index
+function saveFilesIndex(index) {
+  fs.writeFileSync(FILES_INDEX_FILE, JSON.stringify(index, null, 2), "utf-8");
+}
+
+// Generate unique file ID
+function generateFileId() {
+  return `f_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function handleListFiles(payload) {
+  const { type, limit, offset } = payload || {};
+  try {
+    const index = getFilesIndex();
+    let files = index.files || [];
+
+    // Filter by type if specified
+    if (type) {
+      files = files.filter(f => f.type === type);
+    }
+
+    // Sort by createdAt descending (newest first)
+    files.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    // Apply pagination
+    const start = offset || 0;
+    const end = limit ? start + limit : files.length;
+    files = files.slice(start, end);
+
+    return { ok: true, files };
+  } catch (e) {
+    return { ok: false, error: `Failed to list files: ${e.message}` };
+  }
+}
+
+function handleSaveFile(payload) {
+  const { name, content, type, mimeType, sourceUrl, sessionId, originalPath } = payload || {};
+  if (!name || !type) {
+    return { ok: false, error: "Missing name or type" };
+  }
+
+  try {
+    const id = generateFileId();
+    const now = new Date().toISOString();
+
+    // Determine storage subdirectory based on type
+    let subdir;
+    switch (type) {
+      case "upload":
+        subdir = FILES_UPLOADS_DIR;
+        break;
+      case "created":
+        subdir = FILES_CREATED_DIR;
+        break;
+      case "download":
+        subdir = FILES_DOWNLOADS_DIR;
+        break;
+      default:
+        return { ok: false, error: `Invalid file type: ${type}` };
+    }
+
+    // Sanitize filename
+    const safeName = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const storedName = `${id}_${safeName}`;
+    const filePath = path.join(subdir, storedName);
+    const relativePath = path.relative(FILES_DIR, filePath);
+
+    // Write file content if provided
+    if (content) {
+      fs.writeFileSync(filePath, content, "utf-8");
+    }
+
+    // Create file metadata
+    const fileEntry = {
+      id,
+      name,
+      type,
+      mimeType: mimeType || "text/plain",
+      size: content ? Buffer.byteLength(content, "utf-8") : 0,
+      path: relativePath,
+      originalPath: originalPath || null,
+      sourceUrl: sourceUrl || null,
+      sessionId: sessionId || null,
+      createdAt: now,
+      tags: [],
+    };
+
+    // Update index
+    const index = getFilesIndex();
+    index.files.push(fileEntry);
+    saveFilesIndex(index);
+
+    return { ok: true, file: fileEntry };
+  } catch (e) {
+    return { ok: false, error: `Failed to save file: ${e.message}` };
+  }
+}
+
+function handleGetFile(payload) {
+  const { fileId } = payload || {};
+  if (!fileId) {
+    return { ok: false, error: "Missing fileId" };
+  }
+
+  try {
+    const index = getFilesIndex();
+    const file = index.files.find(f => f.id === fileId);
+
+    if (!file) {
+      return { ok: false, error: "File not found" };
+    }
+
+    // Read content if file exists on disk
+    const fullPath = path.join(FILES_DIR, file.path);
+    let content = null;
+    if (fs.existsSync(fullPath)) {
+      content = fs.readFileSync(fullPath, "utf-8");
+    }
+
+    return { ok: true, file, content };
+  } catch (e) {
+    return { ok: false, error: `Failed to get file: ${e.message}` };
+  }
+}
+
+function handleDeleteFile(payload) {
+  const { fileId } = payload || {};
+  if (!fileId) {
+    return { ok: false, error: "Missing fileId" };
+  }
+
+  try {
+    const index = getFilesIndex();
+    const fileIndex = index.files.findIndex(f => f.id === fileId);
+
+    if (fileIndex === -1) {
+      return { ok: false, error: "File not found" };
+    }
+
+    const file = index.files[fileIndex];
+
+    // Delete actual file if it exists
+    const fullPath = path.join(FILES_DIR, file.path);
+    if (fs.existsSync(fullPath)) {
+      fs.unlinkSync(fullPath);
+    }
+
+    // Remove from index
+    index.files.splice(fileIndex, 1);
+    saveFilesIndex(index);
+
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `Failed to delete file: ${e.message}` };
+  }
+}
+
+function handleOpenFile(payload) {
+  const { fileId } = payload || {};
+  if (!fileId) {
+    return { ok: false, error: "Missing fileId" };
+  }
+
+  try {
+    const index = getFilesIndex();
+    const file = index.files.find(f => f.id === fileId);
+
+    if (!file) {
+      return { ok: false, error: "File not found" };
+    }
+
+    const fullPath = path.join(FILES_DIR, file.path);
+    if (!fs.existsSync(fullPath)) {
+      // If file was created elsewhere (originalPath), open that instead
+      if (file.originalPath && fs.existsSync(file.originalPath)) {
+        execSync(`open "${file.originalPath}"`);
+        return { ok: true, opened: file.originalPath };
+      }
+      return { ok: false, error: "File not found on disk" };
+    }
+
+    // Open file with default application
+    execSync(`open "${fullPath}"`);
+    return { ok: true, opened: fullPath };
+  } catch (e) {
+    return { ok: false, error: `Failed to open file: ${e.message}` };
+  }
+}
+
+// --- Version and Upgrade Handlers ---
+
+function handleGetVersion() {
+  try {
+    // Get git info from repo (native-host is inside the repo)
+    const repoPath = path.dirname(__dirname);
+
+    let gitCommit = "unknown";
+    let gitBranch = "unknown";
+
+    try {
+      gitCommit = execSync("git rev-parse --short HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+      gitBranch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+    } catch {
+      // Git not available or not a repo
+    }
+
+    return {
+      ok: true,
+      version: VERSION,
+      gitCommit,
+      gitBranch,
+      repoPath,
+    };
+  } catch (e) {
+    return { ok: false, error: `Failed to get version: ${e.message}` };
+  }
+}
+
+function handleCheckForUpdates() {
+  try {
+    const repoPath = path.dirname(__dirname);
+
+    // Fetch latest from remote
+    execSync("git fetch origin", { cwd: repoPath, encoding: "utf-8", timeout: 30000 });
+
+    const localCommit = execSync("git rev-parse HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+    const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+    const remoteCommit = execSync(`git rev-parse origin/${branch}`, { cwd: repoPath, encoding: "utf-8" }).trim();
+
+    const hasUpdates = localCommit !== remoteCommit;
+
+    // Get commit count behind
+    let commitsBehind = 0;
+    if (hasUpdates) {
+      const count = execSync(`git rev-list --count HEAD..origin/${branch}`, { cwd: repoPath, encoding: "utf-8" }).trim();
+      commitsBehind = parseInt(count, 10);
+    }
+
+    return {
+      ok: true,
+      hasUpdates,
+      localCommit: localCommit.slice(0, 7),
+      remoteCommit: remoteCommit.slice(0, 7),
+      commitsBehind,
+      branch,
+    };
+  } catch (e) {
+    return { ok: false, error: `Failed to check for updates: ${e.message}` };
+  }
+}
+
+async function handlePerformUpgrade() {
+  try {
+    const repoPath = path.dirname(__dirname);
+    const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+
+    // 1. Git pull
+    execSync(`git pull origin ${branch}`, { cwd: repoPath, encoding: "utf-8", timeout: 60000 });
+
+    // 2. pnpm install
+    execSync("pnpm install", { cwd: repoPath, encoding: "utf-8", timeout: 120000 });
+
+    // 3. pnpm build
+    execSync("pnpm build", { cwd: repoPath, encoding: "utf-8", timeout: 120000 });
+
+    // 4. Reinstall native host
+    execSync("./install.sh", { cwd: path.join(repoPath, "native-host"), encoding: "utf-8", timeout: 30000 });
+
+    // Get new version info
+    const newCommit = execSync("git rev-parse --short HEAD", { cwd: repoPath, encoding: "utf-8" }).trim();
+
+    return {
+      ok: true,
+      newCommit,
+      message: "Upgrade complete! Please reload the extension from chrome://extensions and restart Chrome.",
+    };
+  } catch (e) {
+    return { ok: false, error: `Upgrade failed: ${e.message}` };
   }
 }
 
@@ -2716,6 +3617,195 @@ function handleDeleteWorkflow(payload) {
   }
 }
 
+// --- Active Workflow Handlers ---
+
+function loadActiveWorkflows() {
+  try {
+    if (fs.existsSync(ACTIVE_WORKFLOWS_FILE)) {
+      return JSON.parse(fs.readFileSync(ACTIVE_WORKFLOWS_FILE, "utf-8"));
+    }
+  } catch (e) {
+    log(`Failed to load active workflows: ${e.message}`);
+  }
+  return [];
+}
+
+function saveActiveWorkflows(workflows) {
+  try {
+    fs.writeFileSync(ACTIVE_WORKFLOWS_FILE, JSON.stringify(workflows, null, 2), "utf-8");
+    return true;
+  } catch (e) {
+    log(`Failed to save active workflows: ${e.message}`);
+    return false;
+  }
+}
+
+function handleListActiveWorkflows() {
+  try {
+    const workflows = loadActiveWorkflows();
+    return { ok: true, workflows };
+  } catch (e) {
+    return { ok: false, error: `Failed to list active workflows: ${e.message}` };
+  }
+}
+
+function handleActivateWorkflow(payload) {
+  const { workflow } = payload || {};
+  if (!workflow) {
+    return { ok: false, error: "Missing workflow data" };
+  }
+
+  try {
+    const workflows = loadActiveWorkflows();
+
+    // Generate unique ID
+    const id = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const activeWorkflow = {
+      ...workflow,
+      id,
+      activatedAt: new Date().toISOString(),
+      runCount: 0,
+      status: workflow.status || "pending",
+    };
+
+    workflows.push(activeWorkflow);
+    saveActiveWorkflows(workflows);
+
+    log(`Activated workflow: ${id} - ${workflow.workflowName}`);
+    return { ok: true, id, workflow: activeWorkflow };
+  } catch (e) {
+    return { ok: false, error: `Failed to activate workflow: ${e.message}` };
+  }
+}
+
+function handleUpdateWorkflowStatus(payload) {
+  const { id, status, stepId, stepStatus, error, result, lastRunAt } = payload || {};
+  if (!id) {
+    return { ok: false, error: "Missing workflow id" };
+  }
+
+  try {
+    const workflows = loadActiveWorkflows();
+    const index = workflows.findIndex(w => w.id === id);
+
+    if (index === -1) {
+      return { ok: false, error: "Workflow not found" };
+    }
+
+    const workflow = workflows[index];
+
+    // Update overall status if provided
+    if (status) {
+      workflow.status = status;
+    }
+
+    // Update overall error if provided
+    if (error !== undefined) {
+      workflow.error = error;
+    }
+
+    // Update last run time
+    if (lastRunAt) {
+      workflow.lastRunAt = lastRunAt;
+      workflow.runCount = (workflow.runCount || 0) + 1;
+    }
+
+    // Update specific step status if provided
+    if (stepId && stepStatus) {
+      const step = workflow.steps.find(s => s.id === stepId);
+      if (step) {
+        step.status = stepStatus;
+        step.lastExecuted = new Date().toISOString();
+        if (result !== undefined) {
+          step.result = result;
+        }
+        if (error !== undefined) {
+          step.error = error;
+        }
+      }
+    }
+
+    workflows[index] = workflow;
+    saveActiveWorkflows(workflows);
+
+    return { ok: true, workflow };
+  } catch (e) {
+    return { ok: false, error: `Failed to update workflow: ${e.message}` };
+  }
+}
+
+function handleDeactivateWorkflow(payload) {
+  const { id } = payload || {};
+  if (!id) {
+    return { ok: false, error: "Missing workflow id" };
+  }
+
+  try {
+    const workflows = loadActiveWorkflows();
+    const index = workflows.findIndex(w => w.id === id);
+
+    if (index === -1) {
+      return { ok: false, error: "Workflow not found" };
+    }
+
+    const removed = workflows.splice(index, 1)[0];
+    saveActiveWorkflows(workflows);
+
+    log(`Deactivated workflow: ${id} - ${removed.workflowName}`);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: `Failed to deactivate workflow: ${e.message}` };
+  }
+}
+
+function handleTestWorkflowStep(payload) {
+  const { workflowId, stepId, testResult } = payload || {};
+  if (!workflowId || !stepId) {
+    return { ok: false, error: "Missing workflowId or stepId" };
+  }
+
+  try {
+    const workflows = loadActiveWorkflows();
+    const workflow = workflows.find(w => w.id === workflowId);
+
+    if (!workflow) {
+      return { ok: false, error: "Workflow not found" };
+    }
+
+    const step = workflow.steps.find(s => s.id === stepId);
+    if (!step) {
+      return { ok: false, error: "Step not found" };
+    }
+
+    // If testResult is provided, record it
+    if (testResult) {
+      step.lastExecuted = new Date().toISOString();
+      step.status = testResult.success ? "completed" : "failed";
+      step.result = testResult.result;
+      step.error = testResult.error;
+      saveActiveWorkflows(workflows);
+    }
+
+    // Return the step info for the extension to execute the actual test
+    return {
+      ok: true,
+      step: {
+        id: step.id,
+        action: step.action,
+        description: step.description,
+        mechanics: step.mechanics,
+      },
+      workflow: {
+        id: workflow.id,
+        pageUrl: workflow.pageUrl,
+      }
+    };
+  } catch (e) {
+    return { ok: false, error: `Failed to test step: ${e.message}` };
+  }
+}
+
 // --- Project-Based Memory Handlers ---
 
 function slugify(text) {
@@ -2745,7 +3835,7 @@ function handleListProjects() {
 }
 
 function handleCreateProject(payload) {
-  const { name, description } = payload || {};
+  const { name, description, instructions } = payload || {};
   if (!name || !name.trim()) {
     return { ok: false, error: "Missing project name" };
   }
@@ -2767,6 +3857,7 @@ function handleCreateProject(payload) {
       id,
       name: name.trim(),
       description: (description || "").trim(),
+      instructions: (instructions || "").trim(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -2782,6 +3873,7 @@ function handleCreateProject(payload) {
     fs.writeFileSync(path.join(projectDir, "facts.json"), "[]", "utf-8");
     fs.writeFileSync(path.join(projectDir, "people.json"), "[]", "utf-8");
     fs.writeFileSync(path.join(projectDir, "documents.json"), "[]", "utf-8");
+    fs.writeFileSync(path.join(projectDir, "memory.md"), "", "utf-8");
 
     // Add to projects index
     const projects = loadProjectsIndex();
@@ -2852,10 +3944,25 @@ function handleGetProjectMemory(payload) {
   };
 
   try {
+    // Read instructions from meta.json
+    let instructions = "";
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(projectDir, "meta.json"), "utf-8"));
+      instructions = meta.instructions || "";
+    } catch {}
+
+    // Read memory summary
+    let memorySummary = "";
+    try {
+      memorySummary = fs.readFileSync(path.join(projectDir, "memory.md"), "utf-8");
+    } catch {}
+
     const memory = {
       facts: readJsonArray("facts.json"),
       people: readJsonArray("people.json"),
       documents: readJsonArray("documents.json"),
+      instructions,
+      memorySummary,
     };
 
     return { ok: true, memory };
@@ -2910,16 +4017,8 @@ async function handleRunMcpSetup(payload) {
 function handleUpdateProjectMemory(payload) {
   const { projectId, type, action, item } = payload || {};
 
-  if (!projectId || !type || !action || !item) {
+  if (!projectId || !type) {
     return { ok: false, error: "Missing required fields" };
-  }
-
-  if (!["facts", "people", "documents"].includes(type)) {
-    return { ok: false, error: "Invalid memory type" };
-  }
-
-  if (!["add", "remove"].includes(action)) {
-    return { ok: false, error: "Invalid action" };
   }
 
   // Validate projectId
@@ -2930,6 +4029,69 @@ function handleUpdateProjectMemory(payload) {
   const projectDir = path.join(MEMORY_PROJECTS_DIR, projectId);
   if (!projectDir.startsWith(MEMORY_PROJECTS_DIR)) {
     return { ok: false, error: "Path traversal blocked" };
+  }
+
+  // Handle memorySummary type — writes directly to memory.md
+  if (type === "memorySummary") {
+    const memoryPath = path.join(projectDir, "memory.md");
+    try {
+      fs.writeFileSync(memoryPath, (item || "").trim(), "utf-8");
+
+      // Update project timestamp
+      const metaPath = path.join(projectDir, "meta.json");
+      try {
+        const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+        meta.updatedAt = new Date().toISOString();
+        fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf-8");
+
+        const projects = loadProjectsIndex();
+        const idx = projects.findIndex(p => p.id === projectId);
+        if (idx >= 0) {
+          projects[idx].updatedAt = meta.updatedAt;
+          saveProjectsIndex(projects);
+        }
+      } catch {}
+
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: `Failed to update memory summary: ${e.message}` };
+    }
+  }
+
+  // Handle instructions type — updates meta.json directly
+  if (type === "instructions") {
+    const metaPath = path.join(projectDir, "meta.json");
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8"));
+      meta.instructions = (item || "").trim();
+      meta.updatedAt = new Date().toISOString();
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf-8");
+
+      // Update timestamp in index
+      const projects = loadProjectsIndex();
+      const idx = projects.findIndex(p => p.id === projectId);
+      if (idx >= 0) {
+        projects[idx].updatedAt = meta.updatedAt;
+        saveProjectsIndex(projects);
+      }
+
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: `Failed to update instructions: ${e.message}` };
+    }
+  }
+
+  // For array-based types (facts, people, documents)
+  if (!action || !item) {
+    return { ok: false, error: "Missing required fields" };
+  }
+
+  if (!["facts", "people", "documents"].includes(type)) {
+    return { ok: false, error: "Invalid memory type" };
+  }
+
+  if (!["add", "remove"].includes(action)) {
+    return { ok: false, error: "Invalid action" };
   }
 
   const filename = `${type}.json`;

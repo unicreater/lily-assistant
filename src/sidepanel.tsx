@@ -4,6 +4,7 @@ import { ClaudeSetup } from "~components/ClaudeSetup";
 import { OnboardingFlow } from "~components/OnboardingFlow";
 import { SetupWizard } from "~components/SetupWizard";
 import { StatusIndicator } from "~components/StatusIndicator";
+import { THEMES, DEFAULT_THEME, applyTheme } from "~lib/themes";
 
 import "~style.css";
 
@@ -51,17 +52,34 @@ function SidePanel() {
     }
   };
 
+  // Load saved theme on mount
+  useEffect(() => {
+    sendNative("getState", { key: "theme" }).then((res) => {
+      if (res?.ok && res.data?.id && THEMES[res.data.id]) {
+        applyTheme(res.data.id);
+      } else {
+        applyTheme(DEFAULT_THEME);
+      }
+    }).catch(() => applyTheme(DEFAULT_THEME));
+  }, []);
+
   useEffect(() => {
     checkConnection();
   }, []);
 
   return (
-    <div className="h-screen bg-lily-bg text-lily-text font-sans flex flex-col overflow-hidden">
-      <header className="flex items-center justify-between px-4 py-3 glass border-b-0">
+    <div className="h-screen text-lily-text font-sans flex flex-col overflow-hidden relative">
+      {/* Animated gradient mesh background */}
+      <div className="gradient-mesh" aria-hidden="true" />
+      {/* Subtle noise texture overlay */}
+      <div className="noise-overlay" aria-hidden="true" />
+
+      {/* Content layer */}
+      <header className="flex items-center justify-between px-4 py-3 glass border-b-0 relative z-10">
         <h1 className="text-lg font-semibold">Lily</h1>
         <StatusIndicator connected={connected} />
       </header>
-      <main className="flex-1 flex flex-col min-h-0">
+      <main className="flex-1 flex flex-col min-h-0 relative z-10">
         {view === "loading" && (
           <div className="flex items-center justify-center h-64">
             <span className="text-lily-muted">Connecting...</span>

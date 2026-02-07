@@ -84,6 +84,12 @@ export function IntegrationsView({ onStartAuthChat }: IntegrationsViewProps) {
   const [setupInProgress, setSetupInProgress] = useState(false);
   // Toast notifications
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
+  // Version and upgrade state
+  const [versionInfo, setVersionInfo] = useState<{ version: string; gitCommit: string; gitBranch: string } | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<{ hasUpdates: boolean; commitsBehind: number; localCommit: string; remoteCommit: string } | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [upgrading, setUpgrading] = useState(false);
+  const [upgradeResult, setUpgradeResult] = useState<{ ok: boolean; message?: string; error?: string } | null>(null);
 
   const loadIntegrations = useCallback(async () => {
     setLoading(true);
@@ -114,6 +120,51 @@ export function IntegrationsView({ onStartAuthChat }: IntegrationsViewProps) {
   useEffect(() => {
     loadIntegrations();
   }, [loadIntegrations]);
+
+  // Load version info on mount
+  useEffect(() => {
+    sendNative("getVersion").then((res) => {
+      if (res?.ok) {
+        setVersionInfo({ version: res.version, gitCommit: res.gitCommit, gitBranch: res.gitBranch });
+      }
+    });
+  }, []);
+
+  const checkForUpdates = useCallback(async () => {
+    setCheckingUpdates(true);
+    setUpdateInfo(null);
+    try {
+      const res = await sendNative("checkForUpdates");
+      if (res?.ok) {
+        setUpdateInfo(res);
+      } else {
+        setToast({ message: res?.error || "Failed to check for updates", type: "error" });
+      }
+    } catch (e: any) {
+      setToast({ message: e.message, type: "error" });
+    } finally {
+      setCheckingUpdates(false);
+    }
+  }, []);
+
+  const performUpgrade = useCallback(async () => {
+    setUpgrading(true);
+    setUpgradeResult(null);
+    try {
+      const res = await sendNative("performUpgrade");
+      setUpgradeResult(res);
+      if (res?.ok) {
+        setToast({ message: "Upgrade complete! Please reload the extension.", type: "success" });
+      } else {
+        setToast({ message: res?.error || "Upgrade failed", type: "error" });
+      }
+    } catch (e: any) {
+      setUpgradeResult({ ok: false, error: e.message });
+      setToast({ message: e.message, type: "error" });
+    } finally {
+      setUpgrading(false);
+    }
+  }, []);
 
   const runSetup = async (integration: Integration) => {
     if (integration.builtIn) return;
@@ -566,6 +617,91 @@ export function IntegrationsView({ onStartAuthChat }: IntegrationsViewProps) {
                 </div>
               </button>
             ))}
+          </div>
+        )}
+      </div>
+
+      {/* Updates Section */}
+      <div className="mt-4 p-3 glass-card rounded-lg">
+        <h3 className="text-sm font-semibold mb-2 flex items-center gap-2">
+          <span>🔄</span> Updates
+        </h3>
+
+        {/* Version info */}
+        {versionInfo && (
+          <p className="text-xs text-lily-muted mb-2">
+            Version: <span className="text-lily-text">{versionInfo.version}</span>
+            <span className="text-lily-muted ml-1">({versionInfo.gitCommit})</span>
+          </p>
+        )}
+
+        {/* Check for updates */}
+        {!updateInfo && !upgradeResult?.ok && (
+          <button
+            onClick={checkForUpdates}
+            disabled={checkingUpdates}
+            className="w-full px-3 py-2 rounded-lg glass-card text-sm hover:ring-1 hover:ring-lily-accent transition-all disabled:opacity-50"
+          >
+            {checkingUpdates ? "Checking..." : "Check for Updates"}
+          </button>
+        )}
+
+        {/* Update available */}
+        {updateInfo && !updateInfo.hasUpdates && !upgradeResult?.ok && (
+          <div className="text-xs text-green-400 flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+              <path fillRule="evenodd" d="M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.844-8.791a.75.75 0 0 0-1.188-.918l-3.7 4.79-1.649-1.833a.75.75 0 1 0-1.114 1.004l2.25 2.5a.75.75 0 0 0 1.151-.043l4.25-5.5Z" clipRule="evenodd" />
+            </svg>
+            You're up to date!
+          </div>
+        )}
+
+        {updateInfo && updateInfo.hasUpdates && !upgradeResult?.ok && (
+          <div className="space-y-2">
+            <div className="text-xs text-yellow-400 flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+                <path fillRule="evenodd" d="M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm.75-10.25a.75.75 0 0 0-1.5 0v4.5a.75.75 0 0 0 1.5 0v-4.5ZM8 11a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z" clipRule="evenodd" />
+              </svg>
+              Update available! ({updateInfo.commitsBehind} commit{updateInfo.commitsBehind !== 1 ? "s" : ""} behind)
+            </div>
+            <p className="text-[10px] text-lily-muted">
+              {updateInfo.localCommit} → {updateInfo.remoteCommit}
+            </p>
+            <button
+              onClick={performUpgrade}
+              disabled={upgrading}
+              className="w-full px-3 py-2 rounded-lg bg-lily-accent text-white text-sm hover:bg-lily-hover transition-all disabled:opacity-50"
+            >
+              {upgrading ? "Upgrading... (this may take a minute)" : "Upgrade Now"}
+            </button>
+          </div>
+        )}
+
+        {/* Upgrade complete */}
+        {upgradeResult?.ok && (
+          <div className="space-y-2">
+            <div className="text-xs text-green-400 flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+                <path fillRule="evenodd" d="M8 15A7 7 0 1 0 8 1a7 7 0 0 0 0 14Zm3.844-8.791a.75.75 0 0 0-1.188-.918l-3.7 4.79-1.649-1.833a.75.75 0 1 0-1.114 1.004l2.25 2.5a.75.75 0 0 0 1.151-.043l4.25-5.5Z" clipRule="evenodd" />
+              </svg>
+              Upgrade complete!
+            </div>
+            <div className="text-xs text-lily-muted space-y-1">
+              <p className="font-medium text-lily-text">To finish the upgrade:</p>
+              <ol className="list-decimal ml-4 space-y-0.5">
+                <li>Go to <code className="text-lily-accent">chrome://extensions</code></li>
+                <li>Click the refresh icon (↻) on Lily</li>
+                <li>Quit Chrome completely (Cmd+Q)</li>
+                <li>Reopen Chrome</li>
+              </ol>
+            </div>
+          </div>
+        )}
+
+        {/* Upgrade error */}
+        {upgradeResult && !upgradeResult.ok && (
+          <div className="text-xs text-red-400">
+            Error: {upgradeResult.error}
           </div>
         )}
       </div>

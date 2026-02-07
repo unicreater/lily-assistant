@@ -6,13 +6,13 @@ module.exports = {
     extend: {
       colors: {
         lily: {
-          bg: '#0f0f1a',
-          card: '#16213e',
-          accent: '#e94560',
-          hover: '#ff6b6b',
-          text: '#e0e0e0',
-          muted: '#8892b0',
-          border: '#2a2a4a',
+          bg: 'var(--lily-bg)',
+          card: 'var(--lily-card)',
+          accent: 'var(--lily-accent)',
+          hover: 'var(--lily-accent-hover)',
+          text: 'var(--lily-text)',
+          muted: 'var(--lily-muted)',
+          border: 'var(--lily-border)',
         }
       },
       fontFamily: {
@@ -20,22 +20,20 @@ module.exports = {
         mono: ['SF Mono', 'Fira Code', 'monospace']
       },
       backdropBlur: {
-        'glass': '13px',
-        'glass-heavy': '20px',
+        'glass': '16px',
+        'glass-heavy': '24px',
       },
       animation: {
         'fade-in': 'fadeIn 200ms ease-in',
-        'pulse-dot': 'pulseDot 2s ease-in-out infinite',
       },
       keyframes: {
         fadeIn: {
           '0%': { opacity: '0' },
           '100%': { opacity: '1' }
         },
-        pulseDot: {
-          '0%, 100%': { opacity: '1' },
-          '50%': { opacity: '0.5' }
-        }
+      },
+      transitionTimingFunction: {
+        'lily': 'cubic-bezier(0.4, 0, 0.2, 1)',
       }
     }
   },
